@@ -202,7 +202,7 @@ int xdp_ferry(struct xdp_md *ctx)
 	count(STAT_SERVICE_HIT);
 
 	__u64 now = bpf_ktime_get_ns();
-	__u32 backend_id;
+	__u32 backend_id = 0;
 	struct backend *be = NULL;
 
 	struct ct_entry *ct = bpf_map_lookup_elem(&conntrack, &fk);
