@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Install BPF toolchain
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang llvm libbpf-dev
+
+      # Generate first: internal/dataplane doesn't compile on Linux without
+      # the bpf2go output.
+      - run: make generate-native
+      - run: make check
+
+      - name: Build pi-tower binary
+        run: make build-linux
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ferry-linux-arm64
+          path: bin/ferry-linux-arm64
+          retention-days: 7

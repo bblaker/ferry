@@ -1,0 +1,7 @@
+* text=auto eol=lf
+
+*.o binary
+
+# Collapse generated files in diffs and keep them out of language stats.
+go.sum linguist-generated=true
+internal/dataplane/*_bpfel.go linguist-generated=true
