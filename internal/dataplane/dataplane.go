@@ -11,7 +11,15 @@ import (
 // Limits shared with bpf/ferry.c. Keep in sync.
 const (
 	MaxServices = 256
-	MaxBackends = 4096
+	MaxBackends = 1024
+)
+
+// Mode selects where the XDP program attaches.
+type Mode string
+
+const (
+	ModeNative  Mode = "xdp-native"  // in the NIC driver; the fast path
+	ModeGeneric Mode = "xdp-generic" // after skb allocation; works anywhere, for testing
 )
 
 type Proto uint8

@@ -29,7 +29,7 @@ jobs:
       - run: make generate-native
       - run: make check
 
-      - name: Build pi-tower binary
+      - name: Build Raspberry Pi binary
         run: make build-linux
       - uses: actions/upload-artifact@v4
         with:

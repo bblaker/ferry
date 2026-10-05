@@ -6,7 +6,9 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
+	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -39,7 +41,18 @@ type XDP struct {
 }
 
 // LoadXDP loads bpf/ferry.c and attaches it to the named interface.
-func LoadXDP(iface string) (*XDP, error) {
+func LoadXDP(iface string, mode Mode, log *slog.Logger) (*XDP, error) {
+	var flags link.XDPAttachFlags
+	switch mode {
+	case ModeNative:
+		// Explicit, so a driver without native XDP fails loudly instead of
+		// silently falling back to the much slower generic path.
+		flags = link.XDPDriverMode
+	case ModeGeneric:
+		flags = link.XDPGenericMode
+	default:
+		return nil, fmt.Errorf("unknown xdp mode %q", mode)
+	}
 	ifc, err := net.InterfaceByName(iface)
 	if err != nil {
 		return nil, err
@@ -53,15 +66,34 @@ func LoadXDP(iface string) (*XDP, error) {
 		return nil, errors.New("maglev_tables: missing inner map spec")
 	}
 	x := &XDP{innerSpec: outer.InnerMap.Copy()}
+	start := time.Now()
 	if err := spec.LoadAndAssign(&x.objs, nil); err != nil {
 		return nil, fmt.Errorf("load bpf objects: %w", err)
 	}
-	x.link, err = link.AttachXDP(link.XDPOptions{Program: x.objs.XdpFerry, Interface: ifc.Index})
+	logProgram(log, x.objs.FerryIngress, time.Since(start))
+
+	x.link, err = link.AttachXDP(link.XDPOptions{Program: x.objs.FerryIngress, Interface: ifc.Index, Flags: flags})
 	if err != nil {
 		x.objs.Close()
-		return nil, fmt.Errorf("attach xdp to %s: %w", iface, err)
+		return nil, fmt.Errorf("attach xdp to %s (%s): %w", iface, mode, err)
 	}
+	log.Info("attached", "iface", iface, "mode", mode)
 	return x, nil
+}
+
+// logProgram reports what the kernel accepted. The load time includes map
+// creation as well as verification.
+func logProgram(log *slog.Logger, prog *ebpf.Program, load time.Duration) {
+	attrs := []any{"prog", "ferry_ingress", "load", load.Round(time.Millisecond)}
+	if info, err := prog.Info(); err == nil {
+		if id, ok := info.ID(); ok {
+			attrs = append(attrs, "id", id)
+		}
+		if n, ok := info.VerifiedInstructions(); ok {
+			attrs = append(attrs, "insns", n)
+		}
+	}
+	log.Info("loaded", attrs...)
 }
 
 func (x *XDP) SetBackend(id uint32, b Backend) error {

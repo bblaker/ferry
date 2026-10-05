@@ -9,7 +9,7 @@ import (
 	"github.com/bblaker/ferry/internal/dataplane"
 )
 
-func openDataplane(iface string, log *slog.Logger) (dataplane.Dataplane, error) {
+func openDataplane(iface string, _ dataplane.Mode, log *slog.Logger) (dataplane.Dataplane, error) {
 	if iface != "" {
 		return nil, errors.New("XDP requires Linux; omit -iface to use the in-memory data plane")
 	}

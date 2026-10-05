@@ -54,7 +54,7 @@ retire backends.
 
 ## Next decision: forwarding mode
 
-`xdp_ferry` currently picks and counts a backend, then returns `XDP_PASS`
+`ferry_ingress` currently picks and counts a backend, then returns `XDP_PASS`
 (shadow mode). Before writing the rewrite, choose a mode:
 
 - **Full NAT (recommended for pi-tower).** DNAT to the backend and SNAT to

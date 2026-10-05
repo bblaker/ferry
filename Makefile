@@ -27,9 +27,9 @@ generate: builder
 generate-native:
 	BPF2GO_CFLAGS="$(BPF2GO_CFLAGS)" go generate ./internal/dataplane/
 
-# Cross-compiles for the pi-tower nodes. Requires generated BPF code.
+# Cross-compiles for the Raspberry Pi edge host. Requires generated BPF code.
 build-linux:
 	GOOS=linux GOARCH=arm64 go build -o bin/ferry-linux-arm64 ./cmd/ferry
 
 run-dev:
-	go run ./cmd/ferry -config deploy/ferry.example.json
+	go run ./cmd/ferry attach -config deploy/ferry.example.json

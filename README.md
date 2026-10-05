@@ -23,7 +23,7 @@ make check      # fmt, tidy, vet, race tests (what CI runs; works on macOS)
 make run-dev    # in-memory data plane with deploy/ferry.example.json
 make generate   # compile bpf/ferry.c in Docker (needs Docker running)
 make build-linux
-sudo ./bin/ferry-linux-arm64 -iface eth0 -config ferry.json
+sudo ./bin/ferry-linux-arm64 attach --iface enp3s0 --mode xdp-native --config ferry.json
 ```
 
 Requires Go 1.27. See [CONTRIBUTING.md](CONTRIBUTING.md) for details.

@@ -28,7 +28,7 @@
 // Keep in sync with internal/dataplane and internal/maglev.
 #define MAGLEV_SIZE 16381
 #define MAX_SERVICES 256
-#define MAX_BACKENDS 4096
+#define MAX_BACKENDS 1024
 #define CT_ENTRIES 65536
 
 struct service_key {
@@ -155,7 +155,7 @@ static __always_inline struct backend *backend_if_active(__u32 id)
 }
 
 SEC("xdp")
-int xdp_ferry(struct xdp_md *ctx)
+int ferry_ingress(struct xdp_md *ctx)
 {
 	void *data = (void *)(long)ctx->data;
 	void *data_end = (void *)(long)ctx->data_end;
