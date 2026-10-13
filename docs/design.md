@@ -6,9 +6,9 @@ Background and motivation: https://bblaker.com/projects/ferry/
 
 ```
  discovery (static file | EndpointSlices) ──snapshot──▶ controlplane.Reconciler
-                                                          │  maglev.Build per service
-                                                          ▼
-                                              dataplane.Dataplane (interface)
+   ▲ re-read on SIGHUP                                    │  maglev.Build per service
+   │                                                      ▼
+ cmd/ferry daemon ── /metrics, /healthz ◀──Stats── dataplane.Dataplane (interface)
                                               ├── Memory  (tests, macOS dev)
                                               └── XDP     (cilium/ebpf → bpf/ferry.c maps)
 ```
@@ -49,8 +49,11 @@ This costs one extra map lookup per new flow; tracked flows skip it.
   so a stale conntrack entry can't land on an unrelated backend that took
   over its ID.
 
-Reconciler ordering: activate backends → swap tables → delete services →
-retire backends.
+Reconciler ordering: activate backends → delete departed services → swap
+tables → retire backends. Deleting before swapping frees service IDs and
+`services` map entries, so a full table can still change. Retiring last is
+what keeps conntrack safe. `Memory` rejects updates that break this order,
+so every reconciler test checks it (see [testing.md](testing.md)).
 
 ## Next decision: forwarding mode
 
@@ -66,8 +69,6 @@ retire backends.
 
 ## Not built yet
 
-- Kubernetes EndpointSlice source (`internal/discovery`)
-- Active and passive health checks that feed discovery
-- gRPC/protobuf control API, Prometheus exporter for `stats`
-- L7 / `crypto/tls` termination path
-- IPv6, conntrack expiry on TCP FIN/RST, weighted Maglev
+See [todo.md](todo.md). Built since the first draft of these notes: SIGHUP
+reload, the Prometheus exporter for `stats` (see [deploy.md](deploy.md#metrics)),
+and the test harness.

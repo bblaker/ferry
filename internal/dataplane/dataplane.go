@@ -8,7 +8,7 @@ import (
 	"net/netip"
 )
 
-// Limits shared with bpf/ferry.c. Keep in sync.
+// Limits shared with bpf/ferry.c. Keep in sync; TestConstantsMatchBPF checks.
 const (
 	MaxServices = 256
 	MaxBackends = 1024
@@ -21,6 +21,15 @@ const (
 	ModeNative  Mode = "xdp-native"  // in the NIC driver; the fast path
 	ModeGeneric Mode = "xdp-generic" // after skb allocation; works anywhere, for testing
 )
+
+// ParseMode validates a -mode flag value.
+func ParseMode(s string) (Mode, error) {
+	switch m := Mode(s); m {
+	case ModeNative, ModeGeneric:
+		return m, nil
+	}
+	return "", fmt.Errorf("unknown xdp mode %q (want %s or %s)", s, ModeNative, ModeGeneric)
+}
 
 type Proto uint8
 
@@ -58,6 +67,22 @@ type Backend struct {
 	Active bool
 }
 
+// Stats are the XDP program's counters, summed over CPUs. They are
+// monotonic for the life of the loaded program.
+type Stats struct {
+	Packets            uint64 // every packet seen
+	ServiceHits        uint64 // destined to a known VIP
+	ConntrackHits      uint64 // reused a tracked, still-active backend
+	ConntrackReselects uint64 // tracked backend was retired; picked again
+	NoTable            uint64 // VIP known but no table installed
+	NoBackend          uint64 // table slot pointed at an inactive backend
+
+	// BackendPackets counts packets steered to each backend ID. IDs with no
+	// packets are omitted. A counter restarts at zero when its ID is
+	// reassigned to a different address.
+	BackendPackets map[uint32]uint64
+}
+
 // Dataplane programs the forwarding tables.
 //
 // Ordering contract (the control plane relies on it):
@@ -65,11 +90,15 @@ type Backend struct {
 //     SetService that installs the table.
 //   - SetService replaces a service's whole table in one atomic step;
 //     readers see either the old table or the new one, never a mix.
+//   - A backend is only deactivated once no installed table references it.
+//
+// Memory enforces the first and last points so tests catch violations.
 type Dataplane interface {
 	SetBackend(id uint32, b Backend) error
 	// SetService installs slots (backend IDs, one per Maglev slot) for the
 	// service and maps key to id.
 	SetService(key ServiceKey, id uint32, slots []uint32) error
 	DeleteService(key ServiceKey, id uint32) error
+	Stats() (Stats, error)
 	Close() error
 }

@@ -1,0 +1,51 @@
+# Ferry systemd unit. Install as /etc/systemd/system/ferry.service; see
+# docs/deploy.md. Set the interface in /etc/default/ferry rather than editing
+# this file:
+#
+#   FERRY_IFACE=enp3s0
+#   FERRY_MODE=xdp-native
+#   FERRY_METRICS_ADDR=127.0.0.1:9469
+
+[Unit]
+Description=Ferry XDP load balancer
+Documentation=https://github.com/bblaker/ferry/blob/main/docs/deploy.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+Environment=FERRY_IFACE=eth0 FERRY_MODE=xdp-native FERRY_METRICS_ADDR=127.0.0.1:9469
+EnvironmentFile=-/etc/default/ferry
+ExecStart=/usr/local/bin/ferry attach -iface ${FERRY_IFACE} -mode ${FERRY_MODE} \
+    -config /etc/ferry/ferry.json -metrics-addr ${FERRY_METRICS_ADDR}
+# Validate first, so `systemctl reload` reports a bad config instead of the
+# daemon quietly keeping the old one.
+ExecReload=/usr/local/bin/ferry check -config /etc/ferry/ferry.json
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+
+# Unprivileged user with only what loading and attaching XDP needs. Without
+# CAP_PERFMON the verifier applies Spectre hardening that rejects ferry_ingress.
+DynamicUser=yes
+AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_PERFMON
+CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_PERFMON
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
