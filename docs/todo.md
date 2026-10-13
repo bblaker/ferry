@@ -57,10 +57,9 @@ passed to the kernel unchanged.
 
 ## Engineering hygiene
 
-15. Run the new CI steps (`test-bpf-native`, `e2e-native`) on GitHub. They
-    pass locally in Docker (Linux 6.10, arm64) but haven't run on GitHub's
-    runners yet. Consider an `ubuntu-24.04-arm` job so CI matches the Pi's
-    architecture.
+15. Add an `ubuntu-24.04-arm` CI job so the BPF and e2e tests also run on
+    the Pi's architecture. Today CI runs them on x86_64; arm64 is covered
+    only locally, in Docker.
 16. Add `staticcheck` or `golangci-lint` to `make check`.
 17. Fuzz the packet parser: random frames through `BPF_PROG_TEST_RUN`,
     asserting `XDP_PASS` and no unexpected counter movement.
