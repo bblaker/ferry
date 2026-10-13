@@ -37,7 +37,7 @@ jobs:
 
       - name: Build Raspberry Pi binary
         run: make build-linux
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ferry-linux-arm64
           path: bin/ferry-linux-arm64
