@@ -9,7 +9,7 @@ import (
 )
 
 func TestExampleConfigLoads(t *testing.T) {
-	for _, path := range []string{"../../deploy/ferry.example.json"} {
+	for _, path := range []string{"../../deploy/ferry.example.json", "../../test/e2e/ferry.json"} {
 		svcs, err := LoadFile(path)
 		if err != nil {
 			t.Fatal(err)
