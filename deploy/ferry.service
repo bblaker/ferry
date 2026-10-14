@@ -1,10 +1,15 @@
 # Ferry systemd unit. Install as /etc/systemd/system/ferry.service; see
-# docs/deploy.md. Set the interface in /etc/default/ferry rather than editing
-# this file:
+# docs/deploy.md. Configure it in /etc/default/ferry rather than here:
 #
 #   FERRY_IFACE=enp3s0
 #   FERRY_MODE=xdp-native
+#   FERRY_SNAT_IP=192.168.1.10     # this host's address on FERRY_IFACE
 #   FERRY_METRICS_ADDR=127.0.0.1:9469
+#   FERRY_FLAGS=                   # extra flags, e.g. -shadow
+#
+# Stopping the service leaves the pinned XDP program forwarding with its
+# last tables, so restarts and upgrades don't drop connections. To remove
+# it: systemctl stop ferry && ferry detach -iface <iface>
 
 [Unit]
 Description=Ferry XDP load balancer
@@ -14,10 +19,10 @@ After=network-online.target
 
 [Service]
 Type=simple
-Environment=FERRY_IFACE=eth0 FERRY_MODE=xdp-native FERRY_METRICS_ADDR=127.0.0.1:9469
+Environment=FERRY_IFACE=eth0 FERRY_MODE=xdp-native FERRY_SNAT_IP= FERRY_METRICS_ADDR=127.0.0.1:9469 FERRY_FLAGS=
 EnvironmentFile=-/etc/default/ferry
-ExecStart=/usr/local/bin/ferry attach -iface ${FERRY_IFACE} -mode ${FERRY_MODE} \
-    -config /etc/ferry/ferry.json -metrics-addr ${FERRY_METRICS_ADDR}
+ExecStart=/usr/local/bin/ferry attach -iface ${FERRY_IFACE} -mode ${FERRY_MODE} -snat-ip=${FERRY_SNAT_IP} \
+    -config /etc/ferry/ferry.json -metrics-addr ${FERRY_METRICS_ADDR} $FERRY_FLAGS
 # Validate first, so `systemctl reload` reports a bad config instead of the
 # daemon quietly keeping the old one.
 ExecReload=/usr/local/bin/ferry check -config /etc/ferry/ferry.json
@@ -25,11 +30,13 @@ ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5
 
-# Unprivileged user with only what loading and attaching XDP needs. Without
-# CAP_PERFMON the verifier applies Spectre hardening that rejects ferry_ingress.
-DynamicUser=yes
+# Runs as uid 0, because pinned state lives under /sys/fs/bpf (root-only),
+# but with only the capabilities loading and attaching XDP needs. Without
+# CAP_PERFMON the verifier applies Spectre hardening that rejects
+# ferry_ingress.
 AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_PERFMON
 CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_PERFMON
+ReadWritePaths=/sys/fs/bpf
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

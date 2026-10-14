@@ -6,8 +6,8 @@ Four layers. Each catches something the layer below can't.
 |---|---|---|---|
 | unit | `make check` | Go | Maglev properties, config parsing, metrics, reload behaviour |
 | reconciler, randomized | (part of `make check`) | Go | update ordering under random snapshots and injected failures |
-| BPF, in-kernel | `make test-bpf` | Docker (macOS) or root (Linux: `make test-bpf-native`) | the real `bpf/ferry.c` against crafted packets, via `BPF_PROG_TEST_RUN` |
-| end-to-end | `make e2e` | Docker (macOS) or root (Linux: `make e2e-native`) | the `ferry` binary on a veth pair: attach, steer, reload, detach |
+| BPF, in-kernel | `make test-bpf` | Docker (macOS) or root (Linux: `make test-bpf-native`) | the real `bpf/ferry.c` against crafted packets, via `BPF_PROG_TEST_RUN`: selection, NAT, checksums, routing, flow state, pinning |
+| end-to-end | `make e2e` | Docker (macOS) or root (Linux: `make e2e-native`) | the `ferry` binary forwarding real TCP/UDP connections; reload, restart, detach |
 
 CI runs all four on every push and PR.
 
@@ -29,12 +29,14 @@ backend is leaked or left active. A failure prints the seed and step.
 
 ## BPF tests
 
-`internal/dataplane/xdp_linux_test.go` loads the compiled program (without
-attaching it) and runs hand-built Ethernet frames through it. Most tests are
-**differential**: they program identical tables into `XDP` and `Memory`, and
-require the kernel to pick the backend that `Memory` (via `Flow.Hash`, the Go
-mirror of `flow_hash`) predicts. That checks the hash, the Maglev table
-layout and the map encodings in one go.
+These load the compiled program (without attaching it) and run hand-built
+Ethernet frames through it. Frames are built with valid checksums.
+
+`internal/dataplane/xdp_linux_test.go` covers backend selection, in shadow
+mode. Most of its tests are **differential**: they program identical tables
+into `XDP` and `Memory`, and require the kernel to pick the backend that
+`Memory` (via `Flow.Hash`, the Go mirror of `flow_hash`) predicts. That
+checks the hash, the Maglev table layout and the map encodings in one go.
 
 They also cover:
 
@@ -48,26 +50,61 @@ They also cover:
 - `TestConstantsMatchBPF`: the map sizes in the ELF match the Go constants.
   This one needs no privileges, so it also runs in `make check` on Linux.
 
+`internal/dataplane/nat_linux_test.go` covers forwarding. Because the
+program routes with `bpf_fib_lookup`, it builds a small topology first: a
+veth with static neighbors for a client, three backends and a gateway, a
+dummy interface, and a blackhole route. Frames are injected as if received
+on the veth. Every output frame's IP and L4 checksums are **recomputed from
+scratch** and compared, which checks the incremental updates. The tests
+cover:
+
+- the forward rewrite (addresses, ports, TTL, MACs from the FIB) and that
+  SNAT ports are unique per backend;
+- the reverse rewrite to on-link clients and to clients behind a gateway;
+- tracked flows keeping backend and port across table swaps;
+- TCP state transitions, expiry, and reclaiming expired ports;
+- SNAT exhaustion with a two-port pool;
+- releasing a retired backend's port when its flow reselects;
+- drops without leaked state for no neighbor, another interface, no route,
+  and TTL 1; a zero UDP checksum staying zero; stray packets passing;
+- pinned maps surviving a reload, and switching from shadow to forwarding
+  on them.
+
 Without root they skip; `make test-bpf*` sets `FERRY_REQUIRE_BPF=1` so a
-skip fails instead. `BenchmarkIngress` reports in-kernel time per tracked
-packet (about 45 ns on an M-series Mac under Docker). Use it to spot
-regressions, not as a line-rate figure.
+skip fails instead. `BenchmarkIngressShadow` and `BenchmarkIngressForward`
+report in-kernel time per tracked packet (on an M-series Mac under Docker,
+about 46 ns in shadow mode and 92 ns forwarding). Use them to spot
+regressions, not as line-rate figures.
 
 ## End-to-end
 
-`test/e2e/e2e.sh` builds the binary, creates a client network namespace
-joined to the host by a veth pair, starts `ferry attach` on the host end, and
-asserts on `/metrics`. It runs the whole suite in `xdp-generic` and then
-`xdp-native` (veth supports both):
+`test/e2e/e2e.sh` runs the real binary as a full-NAT load balancer. One
+network namespace holds the client and four backend servers on a single
+L2 segment, joined to the host by a veth pair. Ferry is attached to the host
+end, which carries the SNAT address and the VIP, so the client ARPs for the
+VIP like a LAN client would. `test/e2e/e2etool` provides the servers (TCP
+and UDP, replying with their own address and the client address they saw)
+and the clients. The suite runs in `xdp-generic`, then `xdp-native`:
 
 1. attach: program visible in `ip link`, services and backends programmed;
-2. ping to the host still works and isn't counted (shadow mode is transparent);
-3. 100 UDP and 40 TCP flows to the VIPs: every backend gets traffic, and
-   per-backend counts add up to service hits;
-4. SIGHUP after a config edit: old backends retired, new flows go to the new
-   backend;
-5. SIGHUP with a broken config: rejected, tables unchanged, still steering;
-6. SIGTERM: process exits 0 and the XDP program is gone from the interface.
+2. ping to the host still works (non-VIP traffic is untouched);
+3. 60 TCP connections and 60 UDP exchanges through the VIPs: every backend
+   answers, every backend saw the SNAT address, no drops of any kind;
+4. a TCP connection is opened and held, then:
+   - a SIGHUP reload adds a fourth backend, and new connections use it;
+   - ferry stops: the pinned program stays attached and new connections
+     still work with no daemon running;
+   - ferry starts again: it replaces the program in place and restores
+     state, and **the held connection still reaches the same backend**;
+5. a SIGHUP with a broken config is rejected; forwarding continues;
+6. `ferry detach` removes the program and the pinned state.
+
+Two veth details the script handles, neither of which applies to real NICs:
+packets sent on a veth carry only a partial checksum (finished by "offload"
+that native XDP bypasses), so it turns TX checksum offload off in the client
+namespace; and a veth only accepts native `XDP_TX` frames if its peer has XDP
+enabled, so it attaches a pass-everything program there
+(`e2etool xdp-pass`).
 
 Set `FERRY_E2E_MODES=xdp-generic` to run one mode only.
 
@@ -82,13 +119,20 @@ notices. These were checked when the harness was written:
 | reconciler retires backends before swapping tables | `TestApplyRandomized` (contract violation) |
 | reconciler deletes old services after adding new ones | `TestFullServiceTableCanChange` |
 | e2e metric parsing broken | e2e fails on the first per-backend check |
+| TTL change left out of the IP checksum | `TestForwardRewritesToBackend`, `TestReplyRewritesToClient` |
+| port change left out of the L4 checksum | same |
+| flows never expire | `TestExpiredFlowStartsOver`, `TestSNATExhaustion` |
+| no egress-interface check | `TestUnroutableBackendsDropWithoutState` |
+| reconciler ignores restored state | `TestRestoreKeepsIDs` |
 
 ## Adding tests
 
-- A new packet-path behaviour belongs in `xdp_linux_test.go`. Build the frame
-  with `frame()`, and compare against `Memory` where the behaviour is about
-  backend choice.
+- A new packet-path behaviour belongs in `xdp_linux_test.go` (selection) or
+  `nat_linux_test.go` (forwarding). Build the frame with `frame()` or
+  `withFlags()`, compare against `Memory` where the behaviour is about
+  backend choice, and decode output with `decode()`, which checks checksums.
 - A new ordering rule belongs in `Memory`, as a rejected update, so every
   reconciler test enforces it.
-- Keep e2e for things only the real binary shows: signals, flags, attach and
-  detach, the metrics endpoint.
+- Keep e2e for things only the real binary and kernel stack show: real
+  connections, signals, flags, attach, restart and detach, the metrics
+  endpoint.
