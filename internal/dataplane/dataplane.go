@@ -6,6 +6,8 @@ package dataplane
 import (
 	"fmt"
 	"net/netip"
+	"strconv"
+	"strings"
 )
 
 // Limits shared with bpf/ferry.c. Keep in sync; TestConstantsMatchBPF checks.
@@ -30,6 +32,46 @@ func ParseMode(s string) (Mode, error) {
 	}
 	return "", fmt.Errorf("unknown xdp mode %q (want %s or %s)", s, ModeNative, ModeGeneric)
 }
+
+// XDPConfig configures the XDP data plane (Linux only).
+type XDPConfig struct {
+	Iface string
+	Mode  Mode
+	// Shadow selects backends and counts packets, but passes every packet
+	// to the kernel unmodified.
+	Shadow bool
+	// SNAT is the source address of packets sent to backends. It must be
+	// an address of Iface, so that replies come back to it.
+	SNAT      netip.Addr
+	SNATPorts PortRange
+	// PinDir, if set, is a bpffs directory to pin the maps and attachment
+	// under (in a subdirectory per interface). Pinned, they outlive the
+	// process: a restart replaces the program in place and keeps every
+	// tracked flow.
+	PinDir string
+}
+
+// PortRange is an inclusive range of ports, such as the SNAT pool.
+type PortRange struct{ Min, Max uint16 }
+
+// DefaultSNATPorts sits inside Linux's default ephemeral range
+// (32768-60999), so it must be reserved with ip_local_reserved_ports; see
+// docs/deploy.md. Ports are only unique per backend, so this allows 20000
+// concurrent flows to each backend.
+var DefaultSNATPorts = PortRange{40000, 59999}
+
+// ParsePortRange parses "min-max".
+func ParsePortRange(s string) (PortRange, error) {
+	a, b, ok := strings.Cut(s, "-")
+	lo, err1 := strconv.ParseUint(a, 10, 16)
+	hi, err2 := strconv.ParseUint(b, 10, 16)
+	if !ok || err1 != nil || err2 != nil || lo == 0 || lo > hi {
+		return PortRange{}, fmt.Errorf("port range %q: want min-max with 0 < min <= max <= 65535", s)
+	}
+	return PortRange{uint16(lo), uint16(hi)}, nil
+}
+
+func (r PortRange) String() string { return fmt.Sprintf("%d-%d", r.Min, r.Max) }
 
 type Proto uint8
 
@@ -77,10 +119,28 @@ type Stats struct {
 	NoTable            uint64 // VIP known but no table installed
 	NoBackend          uint64 // table slot pointed at an inactive backend
 
+	Forwarded uint64 // client packets NATed to a backend
+	Replied   uint64 // backend packets NATed back to a client
+
+	// Packets dropped while forwarding, by reason.
+	SNATExhausted  uint64 // no free SNAT port toward the backend
+	NoNeighbor     uint64 // next hop's MAC address not resolved
+	FIBFailed      uint64 // no usable route
+	WrongInterface uint64 // route leaves by another interface
+	TTLExceeded    uint64
+
 	// BackendPackets counts packets steered to each backend ID. IDs with no
 	// packets are omitted. A counter restarts at zero when its ID is
 	// reassigned to a different address.
 	BackendPackets map[uint32]uint64
+}
+
+// State is what a data plane already has programmed. An XDP data plane with
+// pinned maps outlives the process, and a restarted control plane adopts its
+// IDs so tracked flows keep resolving to the same backends.
+type State struct {
+	Backends map[uint32]Backend // including retired (inactive) ones
+	Services map[ServiceKey]uint32
 }
 
 // Dataplane programs the forwarding tables.
@@ -100,5 +160,6 @@ type Dataplane interface {
 	SetService(key ServiceKey, id uint32, slots []uint32) error
 	DeleteService(key ServiceKey, id uint32) error
 	Stats() (Stats, error)
+	State() (State, error)
 	Close() error
 }

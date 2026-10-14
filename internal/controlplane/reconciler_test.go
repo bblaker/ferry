@@ -93,3 +93,44 @@ func TestEmptyServiceIsRemoved(t *testing.T) {
 		t.Error("service with no backends should be removed from the data plane")
 	}
 }
+
+// TestRestoreKeepsIDs: a reconciler restarted on a surviving data plane must
+// reuse its backend IDs, or tracked flows would resolve to whichever backend
+// a fresh allocator handed their old ID to.
+func TestRestoreKeepsIDs(t *testing.T) {
+	r1, dp := newTest(t)
+	snap := []discovery.Service{svc(web, "10.0.0.1:8443", "10.0.0.2:8443", "10.0.0.3:8443")}
+	if err := r1.Apply(snap); err != nil {
+		t.Fatal(err)
+	}
+	// Retire one so the restored allocator has a gap to respect.
+	if err := r1.Apply([]discovery.Service{svc(web, "10.0.0.2:8443", "10.0.0.3:8443")}); err != nil {
+		t.Fatal(err)
+	}
+	before := r1.Backends()
+
+	st, err := dp.State()
+	if err != nil {
+		t.Fatal(err)
+	}
+	r2 := NewReconciler(dp, maglev.DefaultSize, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	r2.Restore(st)
+	snap = []discovery.Service{svc(web, "10.0.0.2:8443", "10.0.0.3:8443", "10.0.0.4:8443")}
+	if err := r2.Apply(snap); err != nil {
+		t.Fatal(err)
+	}
+	after := r2.Backends()
+	for id, addr := range before {
+		if after[id] != addr {
+			t.Errorf("backend %s had ID %d; after restore ID %d is %s", addr, id, id, after[id])
+		}
+	}
+	for id, addr := range after {
+		if addr.String() == "10.0.0.4:8443" && id <= 2 {
+			t.Errorf("new backend got ID %d, which the previous run used (IDs 0-2)", id)
+		}
+	}
+	if dp.Services() != 1 {
+		t.Errorf("%d services programmed, want 1", dp.Services())
+	}
+}

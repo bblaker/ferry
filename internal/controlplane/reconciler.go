@@ -53,6 +53,30 @@ func NewReconciler(dp dataplane.Dataplane, tableSize uint64, log *slog.Logger) *
 	}
 }
 
+// Restore adopts the IDs of a data plane that outlived the previous
+// process (pinned XDP maps), so tracked flows keep resolving to the same
+// backends. Call it once, before the first Apply. Services are re-programmed
+// on that Apply; Maglev tables are deterministic, so their slots don't move.
+func (r *Reconciler) Restore(st dataplane.State) {
+	var maxBackend, maxService int64 = -1, -1
+	for id, b := range st.Backends {
+		if b.Active {
+			r.backendIDs[b.Addr] = id
+		}
+		// Retired IDs count too: tracked flows may still name them.
+		maxBackend = max(maxBackend, int64(id))
+	}
+	for key, id := range st.Services {
+		r.services[key] = &serviceState{id: id} // nil backends: reprogram
+		maxService = max(maxService, int64(id))
+	}
+	r.nextBackend = uint32((maxBackend + 1) % dataplane.MaxBackends)
+	r.nextService = uint32((maxService + 1) % dataplane.MaxServices)
+	if len(st.Backends) > 0 || len(st.Services) > 0 {
+		r.log.Info("restored data plane state", "backends", len(r.backendIDs), "services", len(r.services))
+	}
+}
+
 // Apply converges the data plane on the given snapshot. On error the data
 // plane may be partially updated; calling Apply again with the same snapshot
 // finishes the job.
