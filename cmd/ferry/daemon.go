@@ -2,9 +2,11 @@ package main
 
 import (
 	"cmp"
+	"context"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/netip"
 	"runtime"
@@ -25,6 +27,8 @@ type daemon struct {
 	config string
 	log    *slog.Logger
 
+	applied chan struct{} // signalled after each successful apply
+
 	mu        sync.Mutex
 	rec       *controlplane.Reconciler
 	reloads   map[string]uint64 // by result: "success", "failure"
@@ -37,6 +41,7 @@ func newDaemon(dp dataplane.Dataplane, config string, log *slog.Logger) *daemon 
 		dp:      dp,
 		config:  config,
 		log:     log,
+		applied: make(chan struct{}, 1),
 		rec:     controlplane.NewReconciler(dp, maglev.DefaultSize, log),
 		reloads: map[string]uint64{"success": 0, "failure": 0},
 	}
@@ -48,7 +53,63 @@ func (d *daemon) apply(services []discovery.Service) error {
 	defer d.mu.Unlock()
 	err := d.rec.Apply(services)
 	d.record(err)
+	if err == nil {
+		select {
+		case d.applied <- struct{}{}:
+		default:
+		}
+	}
 	return err
+}
+
+// warmNeighbors keeps the kernel's neighbor (ARP) entries for each
+// backend's next hop resolved. The XDP program reads them through
+// bpf_fib_lookup but can't trigger resolution: a miss drops the packet and
+// counts it as no_neighbor. Sending a zero-length UDP datagram to the
+// backend's discard port makes the kernel resolve the next hop.
+//
+// It also warns about backends routed out of another interface, which
+// one-armed forwarding can't reach.
+func (d *daemon) warmNeighbors(ctx context.Context, iface string, every time.Duration) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	warned := map[netip.Addr]bool{}
+	for {
+		d.mu.Lock()
+		backends := d.rec.Backends()
+		d.mu.Unlock()
+		local, _ := ifaceAddrs(iface)
+
+		seen := map[netip.Addr]bool{}
+		for _, b := range backends {
+			ip := b.Addr()
+			if seen[ip] {
+				continue
+			}
+			seen[ip] = true
+			c, err := net.DialUDP("udp4", nil, net.UDPAddrFromAddrPort(netip.AddrPortFrom(ip, 9)))
+			if err != nil {
+				if !warned[ip] {
+					d.log.Warn("backend unreachable", "backend", ip, "err", err)
+					warned[ip] = true
+				}
+				continue
+			}
+			src := c.LocalAddr().(*net.UDPAddr).AddrPort().Addr().Unmap()
+			c.Write(nil)
+			c.Close()
+			if len(local) > 0 && !slices.Contains(local, src) && !warned[ip] {
+				d.log.Warn("backend is routed out of another interface; ferry only forwards out of "+iface, "backend", ip, "source", src)
+				warned[ip] = true
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		case <-d.applied:
+		}
+	}
 }
 
 func (d *daemon) record(err error) {
@@ -157,6 +218,23 @@ func writeMetrics(w io.Writer, m metricsSnapshot) {
 	} {
 		metric(c.name, "counter", c.help)
 		fmt.Fprintf(w, "%s %d\n", c.name, c.v)
+	}
+
+	metric("ferry_forwarded_packets_total", "counter", "Packets NATed and transmitted, by direction.")
+	fmt.Fprintf(w, "ferry_forwarded_packets_total{direction=\"to_backend\"} %d\n", m.stats.Forwarded)
+	fmt.Fprintf(w, "ferry_forwarded_packets_total{direction=\"to_client\"} %d\n", m.stats.Replied)
+	metric("ferry_dropped_packets_total", "counter", "Packets dropped while forwarding, by reason.")
+	for _, d := range []struct {
+		reason string
+		v      uint64
+	}{
+		{"snat_exhausted", m.stats.SNATExhausted},
+		{"no_neighbor", m.stats.NoNeighbor},
+		{"fib_failed", m.stats.FIBFailed},
+		{"wrong_interface", m.stats.WrongInterface},
+		{"ttl_exceeded", m.stats.TTLExceeded},
+	} {
+		fmt.Fprintf(w, "ferry_dropped_packets_total{reason=%q} %d\n", d.reason, d.v)
 	}
 
 	type backend struct {

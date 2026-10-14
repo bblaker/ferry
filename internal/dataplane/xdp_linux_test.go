@@ -3,12 +3,14 @@
 package dataplane
 
 // These tests run bpf/ferry.c in the kernel with BPF_PROG_TEST_RUN: no
-// interface, no attach, just crafted frames in and map state out. Loading
-// needs root (or CAP_BPF + CAP_NET_ADMIN), so without it they skip; set
-// FERRY_REQUIRE_BPF=1 to make that a failure (`make test-bpf` does).
+// attach, just crafted frames in and frames and map state out. Loading needs
+// root (or CAP_BPF + CAP_NET_ADMIN + CAP_PERFMON), so without it they skip;
+// set FERRY_REQUIRE_BPF=1 to make that a failure (`make test-bpf` does).
 //
-// Most of them are differential: the same tables are programmed into XDP and
-// Memory, and the BPF program must pick the backend Memory predicts.
+// This file covers backend selection, in shadow mode so that conntrack is the
+// only output; nat_linux_test.go covers forwarding. Most tests here are
+// differential: the same tables are programmed into XDP and Memory, and the
+// BPF program must pick the backend Memory predicts.
 
 import (
 	"encoding/binary"
@@ -38,7 +40,12 @@ var (
 
 func newTestXDP(t testing.TB) *XDP {
 	t.Helper()
-	x, err := loadXDP()
+	return loadTestXDP(t, loadOptions{shadow: true})
+}
+
+func loadTestXDP(t testing.TB, o loadOptions) *XDP {
+	t.Helper()
+	x, err := loadXDP(o)
 	if err != nil {
 		if errors.Is(err, os.ErrPermission) && os.Getenv("FERRY_REQUIRE_BPF") == "" {
 			t.Skipf("loading BPF needs root or CAP_BPF+CAP_NET_ADMIN; run `make test-bpf`: %v", err)
@@ -73,10 +80,11 @@ func TestConstantsMatchBPF(t *testing.T) {
 
 // fixture programs identical tables into an XDP and a Memory data plane.
 type fixture struct {
-	t   testing.TB
-	x   *XDP
-	mem *Memory
-	ids map[netip.AddrPort]uint32
+	t       testing.TB
+	x       *XDP
+	mem     *Memory
+	ids     map[netip.AddrPort]uint32
+	ifindex int // ingress interface for frames; 0: loopback
 }
 
 func newFixture(t testing.TB) *fixture {
@@ -128,11 +136,27 @@ func (f *fixture) both(op func(Dataplane) error) {
 // send runs one frame through the program and returns its XDP action.
 func (f *fixture) send(frame []byte) uint32 {
 	f.t.Helper()
-	ret, err := f.x.objs.FerryIngress.Run(&ebpf.RunOptions{Data: frame})
+	ret, _ := f.run(frame)
+	return ret
+}
+
+// xdpMD is struct xdp_md, the context BPF_PROG_TEST_RUN accepts.
+type xdpMD struct {
+	Data, DataEnd, DataMeta, IngressIfindex, RxQueueIndex, EgressIfindex uint32
+}
+
+// run returns the XDP action and the frame as the program left it.
+func (f *fixture) run(frame []byte) (uint32, []byte) {
+	f.t.Helper()
+	opts := &ebpf.RunOptions{Data: frame, DataOut: make([]byte, len(frame))}
+	if f.ifindex != 0 {
+		opts.Context = xdpMD{DataEnd: uint32(len(frame)), IngressIfindex: uint32(f.ifindex)}
+	}
+	ret, err := f.x.objs.FerryIngress.Run(opts)
 	if err != nil {
 		f.t.Fatal(err)
 	}
-	return ret
+	return ret, opts.DataOut
 }
 
 // tracked returns the backend conntrack holds for fl, if any.
@@ -149,9 +173,7 @@ func (f *fixture) tracked(fl Flow) (netip.AddrPort, bool) {
 	if err := f.x.objs.Backends.Lookup(e.BackendId, &b); err != nil {
 		f.t.Fatal(err)
 	}
-	var ip [4]byte
-	binary.NativeEndian.PutUint32(ip[:], b.Ip)
-	return netip.AddrPortFrom(netip.AddrFrom4(ip), be16(b.Port)), true
+	return netip.AddrPortFrom(addrFromBE32(b.Ip), be16(b.Port)), true
 }
 
 // steer sends fl and returns the backend the program chose for it.
@@ -211,9 +233,8 @@ func randomFlows(key ServiceKey, n int, seed uint64) []Flow {
 	return out
 }
 
-// frame builds an Ethernet + IPv4 + TCP/UDP frame for fl. optWords adds that
-// many 4-byte NOP words of IP options. Checksums are left zero; the program
-// does not check them.
+// frame builds an Ethernet + IPv4 + TCP/UDP SYN (or datagram) for fl, with
+// valid checksums. optWords adds that many 4-byte NOP words of IP options.
 func frame(fl Flow, optWords ...int) []byte {
 	opts := 0
 	if len(optWords) > 0 {
@@ -241,9 +262,72 @@ func frame(fl Flow, optWords ...int) []byte {
 	binary.BigEndian.PutUint16(l[2:], fl.Dst.Port())
 	if fl.Proto == TCP {
 		l[12] = 5 << 4 // data offset
-		l[13] = 0x02   // SYN
+		l[13] = tcpSYN
+	} else {
+		binary.BigEndian.PutUint16(l[4:], uint16(l4))
 	}
+	fixChecksums(b)
 	return b
+}
+
+const (
+	tcpFIN = 0x01
+	tcpSYN = 0x02
+	tcpRST = 0x04
+	tcpACK = 0x10
+)
+
+// csum is the Internet checksum of b, continuing from sum.
+func csum(b []byte, sum uint32) uint16 {
+	for i := 0; i+1 < len(b); i += 2 {
+		sum += uint32(binary.BigEndian.Uint16(b[i:]))
+	}
+	if len(b)%2 == 1 {
+		sum += uint32(b[len(b)-1]) << 8
+	}
+	for sum > 0xffff {
+		sum = sum&0xffff + sum>>16
+	}
+	return ^uint16(sum)
+}
+
+// headers splits an Ethernet/IPv4 frame into its IP header and L4 segment.
+func headers(b []byte) (ip, l4 []byte) {
+	ihl := int(b[14]&0x0f) * 4
+	return b[14 : 14+ihl], b[14+ihl:]
+}
+
+// l4Checksum computes the TCP/UDP checksum including the pseudo-header,
+// with the checksum field itself zeroed.
+func l4Checksum(b []byte) uint16 {
+	ip, l4 := headers(b)
+	off := 16 // TCP
+	if ip[9] == byte(UDP) {
+		off = 6
+	}
+	seg := append([]byte(nil), l4...)
+	seg[off], seg[off+1] = 0, 0
+	var sum uint32
+	for i := 12; i < 20; i += 2 {
+		sum += uint32(binary.BigEndian.Uint16(ip[i:]))
+	}
+	sum += uint32(ip[9]) + uint32(len(l4))
+	c := csum(seg, sum)
+	if c == 0 && ip[9] == byte(UDP) {
+		c = 0xffff
+	}
+	return c
+}
+
+func fixChecksums(b []byte) {
+	ip, l4 := headers(b)
+	ip[10], ip[11] = 0, 0
+	binary.BigEndian.PutUint16(ip[10:], csum(ip, 0))
+	off := 16
+	if ip[9] == byte(UDP) {
+		off = 6
+	}
+	binary.BigEndian.PutUint16(l4[off:], l4Checksum(b))
 }
 
 func TestSelectionMatchesMemory(t *testing.T) {
@@ -494,7 +578,7 @@ func TestSetServiceRejectsWrongTableSize(t *testing.T) {
 // BenchmarkIngress reports the kernel's per-packet time for a tracked TCP
 // flow, the common case. BPF_PROG_TEST_RUN timing excludes driver and DMA
 // costs, so treat it as a regression signal, not a line-rate estimate.
-func BenchmarkIngress(b *testing.B) {
+func BenchmarkIngressShadow(b *testing.B) {
 	f := newFixture(b)
 	f.program(testVIP, 0, "10.42.0.11:8443", "10.42.1.12:8443", "10.42.2.13:8443")
 	data := frame(randomFlows(testVIP, 1, 11)[0])

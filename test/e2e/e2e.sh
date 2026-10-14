@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
-# End-to-end test: run the real ferry binary against a veth pair and check,
-# through /metrics, that it steers, reloads, and detaches as documented.
+# End-to-end test: run the real ferry binary as a full-NAT load balancer in
+# front of real TCP and UDP servers, and check connections work, survive a
+# reload and a restart, and that detach cleans up.
 #
-#   client netns                      host (ferry attached here)
-#   ferry-e2e1 10.99.0.2  <-- veth --> ferry-e2e0 10.99.0.1
+#   netns ferry-e2e (one L2 segment)              host (ferry attached here)
+#   ferry-e2e1: client  10.99.0.2   <-- veth -->  ferry-e2e0: 10.99.0.1 (SNAT)
+#               backends 10.99.0.11-14                        10.99.0.240 (VIP)
 #
-# The client has a static neighbor entry for the VIP pointing at ferry-e2e0,
-# so packets to the VIP arrive there without anyone answering ARP. Ferry is
-# in shadow mode (XDP_PASS), so the kernel then drops them as not-for-us;
-# only the counters show what Ferry decided.
+# One-armed, like the edge host: packets come in and go back out of the same
+# interface. The client ARPs for the VIP like any LAN client would.
 #
-# Needs root on Linux, plus iproute2, curl and ping. On macOS, `make e2e`
-# runs this inside the privileged builder container. Set FERRY_BIN to test a
-# prebuilt binary (`make e2e-native` does, so sudo never runs go); otherwise
-# it builds one, which needs the generated BPF code.
+# Needs root on Linux, plus iproute2, curl, ping and ethtool. On macOS,
+# `make e2e` runs this inside the privileged builder container. Set
+# FERRY_BIN and FERRY_E2ETOOL to test prebuilt binaries (`make e2e-native`
+# does, so sudo never runs go); otherwise it builds them, which needs the
+# generated BPF code.
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
@@ -22,10 +23,15 @@ MODES=${FERRY_E2E_MODES:-xdp-generic xdp-native}
 NS=ferry-e2e
 IF=ferry-e2e0
 PEER=ferry-e2e1
-VIP=192.168.1.240
+SNAT=10.99.0.1
+CLIENT=10.99.0.2
+VIP=10.99.0.240
 METRICS=127.0.0.1:19469
+PIN=/sys/fs/bpf/ferry-e2e
 WORK=$(mktemp -d)
 PID=
+SERVERS=
+XDPPASS=
 
 log() { printf '\n== %s\n' "$*"; }
 fail() {
@@ -39,6 +45,9 @@ fail() {
 
 cleanup() {
 	[[ -n $PID ]] && kill "$PID" 2>/dev/null && wait "$PID" 2>/dev/null
+	[[ -n $SERVERS ]] && kill "$SERVERS" 2>/dev/null
+	[[ -n $XDPPASS ]] && kill "$XDPPASS" 2>/dev/null
+	[[ -n ${FERRY_BIN:-} ]] && "$FERRY_BIN" detach -iface "$IF" -pin-dir "$PIN" >/dev/null 2>&1
 	ip netns del "$NS" 2>/dev/null || true
 	ip link del "$IF" 2>/dev/null || true
 	rm -rf "$WORK"
@@ -66,102 +75,133 @@ expect() {
 
 wait_for() {
 	local i
-	for i in $(seq 50); do
+	for i in $(seq 100); do
 		if eval "$1" >/dev/null 2>&1; then return 0; fi
 		sleep 0.1
 	done
 	fail "timed out waiting for: $1"
 }
 
-# udp_flows N sends one datagram from each of N fresh sockets, so each is a
-# new flow with its own source port.
-udp_flows() {
-	ip netns exec "$NS" bash -c "for i in \$(seq $1); do echo x > /dev/udp/$VIP/53; done"
+# client CMD ARGS... runs e2etool in the client's namespace from the client address.
+client() {
+	local cmd=$1
+	shift
+	ip netns exec "$NS" "$E2ETOOL" "$cmd" -from "$CLIENT" "$@"
 }
 
-# tcp_flows N starts N connections to the VIP; each sends a SYN and gives up.
-tcp_flows() {
-	ip netns exec "$NS" bash -c "for i in \$(seq $1); do timeout 0.2 bash -c 'echo > /dev/tcp/$VIP/443' 2>/dev/null & done; wait" || true
-}
+attached() { ip link show dev "$IF" | grep -q 'prog/xdp'; }
 
 start_ferry() {
-	"$FERRY_BIN" attach -iface "$IF" -mode "$1" -config "$WORK/ferry.json" -metrics-addr "$METRICS" \
-		>>"$WORK/ferry.log" 2>&1 &
+	"$FERRY_BIN" attach -iface "$IF" -mode "$1" -snat-ip "$SNAT" -snat-ports 61000-61999 \
+		-pin-dir "$PIN" -config "$WORK/ferry.json" -metrics-addr "$METRICS" >>"$WORK/ferry.log" 2>&1 &
 	PID=$!
 	wait_for "curl -fsS http://$METRICS/healthz"
 }
 
-if [[ -z ${FERRY_BIN:-} ]]; then
+stop_ferry() {
+	kill -TERM "$PID"
+	wait "$PID" || fail "ferry exited with status $?"
+	PID=
+}
+
+if [[ -z ${FERRY_BIN:-} || -z ${FERRY_E2ETOOL:-} ]]; then
 	log "build"
 	go build -o "$WORK/ferry-bin" ./cmd/ferry
+	go build -o "$WORK/e2etool" ./test/e2e/e2etool
 	FERRY_BIN=$WORK/ferry-bin
+	FERRY_E2ETOOL=$WORK/e2etool
 fi
+E2ETOOL=$(realpath "$FERRY_E2ETOOL")
+FERRY_BIN=$(realpath "$FERRY_BIN")
 "$FERRY_BIN" version
 "$FERRY_BIN" check -config test/e2e/ferry.json
 
 log "topology"
+mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf
 ip netns add "$NS"
 ip link add "$IF" type veth peer name "$PEER" netns "$NS"
-ip addr add 10.99.0.1/24 dev "$IF"
+ip addr add "$SNAT/24" dev "$IF"
+ip addr add "$VIP/32" dev "$IF"
 ip link set "$IF" up
-ip -n "$NS" addr add 10.99.0.2/24 dev "$PEER"
-ip -n "$NS" link set "$PEER" up
+sysctl -qw "net.ipv4.conf.$IF.forwarding=1"
 ip -n "$NS" link set lo up
-ip -n "$NS" route add "$VIP/32" dev "$PEER"
-ip -n "$NS" neigh add "$VIP" lladdr "$(cat /sys/class/net/$IF/address)" dev "$PEER"
+ip -n "$NS" link set "$PEER" up
+for a in "$CLIENT" 10.99.0.11 10.99.0.12 10.99.0.13 10.99.0.14; do
+	ip -n "$NS" addr add "$a/24" dev "$PEER"
+done
+# Locally sent packets on a veth carry only a partial checksum, completed by
+# "offload" that native XDP bypasses. Real NICs receive full checksums, so
+# make the senders compute them: that also tests the NAT checksum updates.
+ip netns exec "$NS" ethtool -K "$PEER" tx off >/dev/null
+# A veth drops native XDP_TX frames unless its peer has XDP enabled too.
+ip netns exec "$NS" "$E2ETOOL" xdp-pass "$PEER" &
+XDPPASS=$!
+ip netns exec "$NS" "$E2ETOOL" serve 10.99.0.11:8443 10.99.0.12:8443 10.99.0.13:8443 10.99.0.14:8443 \
+	10.99.0.11:5353 10.99.0.12:5353 &
+SERVERS=$!
 
 for mode in $MODES; do
 	log "$mode: attach"
 	cp test/e2e/ferry.json "$WORK/ferry.json"
 	: >"$WORK/ferry.log"
 	start_ferry "$mode"
-	ip link show dev "$IF" | grep -q 'prog/xdp' || fail "no XDP program on $IF"
+	attached || fail "no XDP program on $IF"
 	expect "services programmed" "$(metric ferry_services)" -eq 2
 	expect "backends active" "$(metric ferry_backends)" -eq 5
 
 	log "$mode: non-VIP traffic is untouched"
-	ip netns exec "$NS" ping -c 3 -i 0.2 -W 1 10.99.0.1 >/dev/null || fail "ping through shadow-mode ferry failed"
-	expect "ping not counted as a service hit" "$(metric ferry_service_hits_total)" -eq 0
+	ip netns exec "$NS" ping -c 3 -i 0.2 -W 1 "$SNAT" >/dev/null || fail "ping to the host failed"
+	printf 'ok   ping\n'
 
-	log "$mode: VIP traffic is steered"
-	udp_flows 100
-	tcp_flows 40
-	hits=$(metric ferry_service_hits_total)
-	expect "service hits" "$hits" -ge 140
-	sum=0
-	for b in 10.42.0.20:53 10.42.1.21:53 10.42.0.11:8443 10.42.1.12:8443 10.42.2.13:8443; do
-		n=$(metric ferry_backend_packets_total "backend=\"$b\"")
-		expect "packets to $b" "$n" -gt 0
-		sum=$((sum + n))
+	log "$mode: connections through the VIP"
+	client dial -proto tcp -addr "$VIP:443" -n 60 -want-servers 3 -want-seen "$SNAT" || fail "TCP through the VIP"
+	client dial -proto udp -addr "$VIP:53" -n 60 -want-servers 2 -want-seen "$SNAT" || fail "UDP through the VIP"
+	expect "packets to backends" "$(metric ferry_forwarded_packets_total 'direction="to_backend"')" -ge 300
+	expect "packets to clients" "$(metric ferry_forwarded_packets_total 'direction="to_client"')" -ge 240
+	for reason in snat_exhausted no_neighbor fib_failed wrong_interface ttl_exceeded; do
+		expect "no $reason drops" "$(metric ferry_dropped_packets_total "reason=\"$reason\"")" -eq 0
 	done
-	expect "backend packets add up to service hits" "$sum" -eq "$hits"
-	expect "no packets to missing tables" "$(metric ferry_no_table_total)" -eq 0
 
-	log "$mode: SIGHUP reload swaps the dns backends"
-	sed -i 's/"10.42.0.20:53", "10.42.1.21:53"/"10.42.9.99:53"/' "$WORK/ferry.json"
+	log "$mode: a held connection survives a reload and a restart"
+	rm -f "$WORK/ready" "$WORK/go"
+	client hold -addr "$VIP:443" -ready "$WORK/ready" -go "$WORK/go" &
+	HOLD=$!
+	wait_for "[ -s $WORK/ready ]"
+	printf 'ok   holding a connection to %s\n' "$(cat "$WORK/ready")"
+
+	sed -i 's/"10.99.0.13:8443"\]/"10.99.0.13:8443", "10.99.0.14:8443"]/' "$WORK/ferry.json"
 	kill -HUP "$PID"
-	wait_for "[ \$(metric ferry_backends) -eq 4 ]"
-	expect "old dns backend retired" "$(metric ferry_backend_packets_total 'backend="10.42.0.20:53"')" -eq 0
-	udp_flows 50
-	expect "new flows reach the new backend" "$(metric ferry_backend_packets_total 'backend="10.42.9.99:53"')" -ge 50
-	expect "reloads succeeded" "$(metric ferry_config_reloads_total 'result="success"')" -eq 2
+	wait_for "[ \$(metric ferry_backends) -eq 6 ]"
+	client dial -proto tcp -addr "$VIP:443" -n 60 -want-servers 4 >/dev/null || fail "new backend not used after reload"
+	printf 'ok   reload added a backend\n'
+
+	stop_ferry
+	attached || fail "pinned program was detached when ferry stopped"
+	client dial -proto tcp -addr "$VIP:443" -n 20 -want-seen "$SNAT" >/dev/null || fail "forwarding stopped with the daemon"
+	printf 'ok   still forwarding with the daemon stopped\n'
+
+	start_ferry "$mode"
+	grep -q "replaced program in place" "$WORK/ferry.log" || fail "restart did not reuse the pinned attachment"
+	grep -q "restored data plane state" "$WORK/ferry.log" || fail "restart did not restore state"
+	touch "$WORK/go"
+	wait "$HOLD" || fail "held connection did not survive"
+	client dial -proto tcp -addr "$VIP:443" -n 60 -want-servers 4 >/dev/null || fail "TCP after restart"
+	printf 'ok   new connections after restart\n'
 
 	log "$mode: a bad config is rejected and the tables stay"
 	echo '{"services": [' >"$WORK/ferry.json"
 	kill -HUP "$PID"
 	wait_for "[ \$(metric ferry_config_reloads_total 'result=\"failure\"') -eq 1 ]"
 	expect "still serving" "$(metric ferry_services)" -eq 2
-	expect "last reload flagged" "$(metric ferry_config_last_reload_successful)" -eq 0
-	before=$(metric ferry_service_hits_total)
-	udp_flows 10
-	expect "still steering" "$(metric ferry_service_hits_total)" -ge $((before + 10))
+	client dial -proto udp -addr "$VIP:53" -n 10 -want-servers 2 >/dev/null || fail "UDP after a rejected reload"
+	printf 'ok   still forwarding\n'
 
-	log "$mode: SIGTERM detaches"
-	kill -TERM "$PID"
-	wait "$PID" || fail "ferry exited with status $?"
-	PID=
-	if ip link show dev "$IF" | grep -q 'prog/xdp'; then fail "XDP program still attached after exit"; fi
-	printf 'ok   detached\n'
+	log "$mode: detach"
+	stop_ferry
+	"$FERRY_BIN" detach -iface "$IF" -pin-dir "$PIN"
+	if attached; then fail "XDP program still attached after detach"; fi
+	[[ ! -e $PIN/$IF ]] || fail "pinned state left in $PIN/$IF"
+	printf 'ok   detached and unpinned\n'
 done
 
 log "PASS ($MODES)"

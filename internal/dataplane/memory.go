@@ -77,6 +77,20 @@ func (m *Memory) DeleteService(key ServiceKey, id uint32) error {
 // Stats returns zeros: Memory does not see packets.
 func (m *Memory) Stats() (Stats, error) { return Stats{}, nil }
 
+// State returns a copy of what is programmed.
+func (m *Memory) State() (State, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	st := State{Backends: map[uint32]Backend{}, Services: map[ServiceKey]uint32{}}
+	for id, b := range m.backends {
+		st.Backends[id] = b
+	}
+	for k, id := range m.services {
+		st.Services[k] = id
+	}
+	return st, nil
+}
+
 func (m *Memory) Close() error { return nil }
 
 // Lookup mirrors the XDP program's table lookup (without connection

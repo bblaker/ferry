@@ -3,6 +3,6 @@
 FROM golang:1.27-bookworm
 RUN apt-get update \
  && apt-get install -y --no-install-recommends clang llvm libbpf-dev linux-libc-dev make \
-    iproute2 iputils-ping curl \
+    iproute2 iputils-ping curl ethtool \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /src

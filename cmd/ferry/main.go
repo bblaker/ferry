@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"runtime/debug"
@@ -27,6 +28,7 @@ const usage = `usage: ferry <command> [flags]
 commands:
   attach   load and attach the XDP program, then keep its tables in sync
   check    validate a service config without touching the data plane
+  detach   remove a pinned program and its flow state from an interface
   version  print the build version
 
 Run "ferry <command> -h" for a command's flags.
@@ -44,6 +46,8 @@ func main() {
 		err = attach(args, log)
 	case "check":
 		err = check(args)
+	case "detach":
+		err = detachCmd(args)
 	case "version":
 		fmt.Println(version())
 		return
@@ -60,36 +64,78 @@ func main() {
 	}
 }
 
+const defaultPinDir = "/sys/fs/bpf/ferry"
+
 func attach(args []string, log *slog.Logger) error {
 	fs := flag.NewFlagSet("attach", flag.ExitOnError)
 	iface := fs.String("iface", "", "network interface to attach XDP to (empty: in-memory data plane, for development)")
 	modeFlag := fs.String("mode", string(dataplane.ModeNative), "xdp-native or xdp-generic")
 	config := fs.String("config", "ferry.json", "static service definition; re-read on SIGHUP")
 	metricsAddr := fs.String("metrics-addr", "127.0.0.1:9469", "serve /metrics and /healthz on this address (empty: disabled)")
+	shadow := fs.Bool("shadow", false, "select backends and count packets, but pass every packet to the kernel unmodified")
+	snatIP := fs.String("snat-ip", "", "source address for packets to backends; an address of -iface (default: its only IPv4 address)")
+	snatPorts := fs.String("snat-ports", dataplane.DefaultSNATPorts.String(), "source ports for packets to backends; must not be kernel ephemeral ports")
+	pinDir := fs.String("pin-dir", defaultPinDir, "bpffs directory for state that survives restarts (empty: detach on exit)")
 	fs.Parse(args)
-	mode, err := dataplane.ParseMode(*modeFlag)
-	if err != nil {
+
+	cfg := dataplane.XDPConfig{Iface: *iface, Shadow: *shadow, PinDir: *pinDir}
+	var err error
+	if cfg.Mode, err = dataplane.ParseMode(*modeFlag); err != nil {
 		return err
 	}
-	return run(*iface, mode, *config, *metricsAddr, log)
+	if cfg.SNATPorts, err = dataplane.ParsePortRange(*snatPorts); err != nil {
+		return fmt.Errorf("-snat-ports: %w", err)
+	}
+	if *snatIP != "" {
+		if cfg.SNAT, err = netip.ParseAddr(*snatIP); err != nil {
+			return fmt.Errorf("-snat-ip: %w", err)
+		}
+	}
+	return run(cfg, *config, *metricsAddr, log)
 }
 
-func run(iface string, mode dataplane.Mode, config, metricsAddr string, log *slog.Logger) error {
+func detachCmd(args []string) error {
+	fs := flag.NewFlagSet("detach", flag.ExitOnError)
+	iface := fs.String("iface", "", "interface to detach from")
+	pinDir := fs.String("pin-dir", defaultPinDir, "bpffs directory ferry attach pinned to")
+	fs.Parse(args)
+	if *iface == "" {
+		return errors.New("detach: -iface is required")
+	}
+	if err := detach(*pinDir, *iface); err != nil {
+		return err
+	}
+	fmt.Printf("detached from %s; flow state dropped\n", *iface)
+	return nil
+}
+
+func run(cfg dataplane.XDPConfig, config, metricsAddr string, log *slog.Logger) error {
 	log.Info("starting", "version", version())
 	// Read the config before attaching, so a bad file never touches the NIC.
 	services, err := discovery.LoadFile(config)
 	if err != nil {
 		return err
 	}
-	dp, err := openDataplane(iface, mode, log)
+	dp, err := openDataplane(cfg, log)
 	if err != nil {
 		return err
 	}
 	defer dp.Close()
 
 	d := newDaemon(dp, config, log)
+	st, err := dp.State()
+	if err != nil {
+		return err
+	}
+	d.rec.Restore(st)
 	if err := d.apply(services); err != nil {
 		return err
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if cfg.Iface != "" && !cfg.Shadow {
+		go d.warmNeighbors(ctx, cfg.Iface, 30*time.Second)
 	}
 
 	var srv *http.Server
@@ -105,18 +151,20 @@ func run(iface string, mode dataplane.Mode, config, metricsAddr string, log *slo
 			}
 		}()
 	}
-	log.Info("ferry running", "services", len(services), "iface", iface, "metrics", metricsAddr)
+	log.Info("ferry running", "services", len(services), "iface", cfg.Iface, "shadow", cfg.Shadow, "metrics", metricsAddr)
 
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	for {
 		select {
 		case <-hup:
 			d.reload()
 		case <-ctx.Done():
-			log.Info("shutting down")
+			if cfg.Iface != "" && cfg.PinDir != "" {
+				log.Info("shutting down; the pinned program keeps forwarding with the current tables (ferry detach removes it)")
+			} else {
+				log.Info("shutting down")
+			}
 			if srv != nil {
 				shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 				defer cancel()

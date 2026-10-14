@@ -50,3 +50,10 @@ func be16(p uint16) uint16 {
 
 // be32 is be16 for an IPv4 address.
 func be32(b [4]byte) uint32 { return binary.NativeEndian.Uint32(b[:]) }
+
+// addrFromBE32 reverses be32.
+func addrFromBE32(v uint32) netip.Addr {
+	var b [4]byte
+	binary.NativeEndian.PutUint32(b[:], v)
+	return netip.AddrFrom4(b)
+}
