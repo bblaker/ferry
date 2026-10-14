@@ -17,8 +17,9 @@ import (
 //
 // Update ordering, per Apply:
 //  1. Activate every backend the new tables reference.
-//  2. Swap each changed service's table (atomic per service).
-//  3. Delete services that disappeared.
+//  2. Delete services that disappeared, freeing their IDs and map entries
+//     for step 3 (both tables are fixed-size).
+//  3. Swap each new or changed service's table (atomic per service).
 //  4. Deactivate backends no longer referenced. Conntrack entries that still
 //     point at them see Active=false in the XDP program and reselect.
 //
@@ -84,7 +85,19 @@ func (r *Reconciler) Apply(snapshot []discovery.Service) error {
 		}
 	}
 
-	// 2. Swap tables for new or changed services. A service with no backends
+	// 2. Delete services that are gone or empty.
+	for key, st := range r.services {
+		if len(desired[key]) > 0 {
+			continue
+		}
+		if err := r.dp.DeleteService(key, st.id); err != nil {
+			return fmt.Errorf("service %s: delete: %w", key, err)
+		}
+		delete(r.services, key)
+		r.log.Info("removed service", "service", key, "id", st.id)
+	}
+
+	// 3. Swap tables for new or changed services. A service with no backends
 	// is removed from the data plane so its traffic falls through to the
 	// kernel rather than hashing into an empty table.
 	for key, bs := range desired {
@@ -115,18 +128,6 @@ func (r *Reconciler) Apply(snapshot []discovery.Service) error {
 		r.log.Info("programmed service", "service", key, "id", id, "backends", len(bs))
 	}
 
-	// 3. Delete services that are gone or empty.
-	for key, st := range r.services {
-		if len(desired[key]) > 0 {
-			continue
-		}
-		if err := r.dp.DeleteService(key, st.id); err != nil {
-			return fmt.Errorf("service %s: delete: %w", key, err)
-		}
-		delete(r.services, key)
-		r.log.Info("removed service", "service", key, "id", st.id)
-	}
-
 	// 4. Retire unreferenced backends.
 	for b, id := range r.backendIDs {
 		if referenced[b] {
@@ -140,6 +141,19 @@ func (r *Reconciler) Apply(snapshot []discovery.Service) error {
 	}
 	return nil
 }
+
+// Backends returns the address of every backend ID currently in use, for
+// labelling per-backend metrics.
+func (r *Reconciler) Backends() map[uint32]netip.AddrPort {
+	out := make(map[uint32]netip.AddrPort, len(r.backendIDs))
+	for b, id := range r.backendIDs {
+		out[id] = b
+	}
+	return out
+}
+
+// Services returns how many services are programmed.
+func (r *Reconciler) Services() int { return len(r.services) }
 
 func (r *Reconciler) buildSlots(bs []netip.AddrPort) ([]uint32, error) {
 	names := make([]string, len(bs))

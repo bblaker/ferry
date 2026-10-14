@@ -21,6 +21,10 @@ func svc(key dataplane.ServiceKey, backends ...string) discovery.Service {
 	return s
 }
 
+func client(key dataplane.ServiceKey, src string) dataplane.Flow {
+	return dataplane.Flow{Src: netip.MustParseAddrPort(src), Dst: netip.AddrPortFrom(key.VIP, key.Port), Proto: key.Proto}
+}
+
 func newTest(t *testing.T) (*Reconciler, *dataplane.Memory) {
 	t.Helper()
 	dp := dataplane.NewMemory()
@@ -32,7 +36,7 @@ func TestApplyProgramsAndRemovesServices(t *testing.T) {
 	if err := r.Apply([]discovery.Service{svc(web, "10.0.0.1:8443", "10.0.0.2:8443")}); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := dp.Lookup(web, 12345); !ok {
+	if _, ok := dp.Lookup(client(web, "10.1.2.3:40000")); !ok {
 		t.Fatal("service not routable after Apply")
 	}
 	if err := r.Apply(nil); err != nil {
