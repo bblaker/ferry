@@ -38,7 +38,7 @@ generate-native:
 # Runs bpf/ferry.c in the kernel via BPF_PROG_TEST_RUN. Needs root, so the
 # container is privileged; natively, the test binary runs under sudo.
 test-bpf: builder
-	$(IN_BUILDER) --privileged $(BUILDER) make generate-native test-bpf-native
+	$(IN_BUILDER) --privileged $(BUILDER) sh -c 'mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf; make generate-native test-bpf-native'
 
 test-bpf-native:
 	FERRY_REQUIRE_BPF=1 go test -count=1 -v $(if $(SUDO),-exec "sudo env FERRY_REQUIRE_BPF=1") ./internal/dataplane/
@@ -49,7 +49,8 @@ e2e: builder
 
 e2e-native:
 	go build -o bin/ferry-e2e ./cmd/ferry
-	$(SUDO) env FERRY_BIN=bin/ferry-e2e test/e2e/e2e.sh
+	go build -o bin/e2etool ./test/e2e/e2etool
+	$(SUDO) env FERRY_BIN=bin/ferry-e2e FERRY_E2ETOOL=bin/e2etool test/e2e/e2e.sh
 
 # Cross-compiles for the Raspberry Pi edge host (GOARCH=amd64 for x86).
 # Requires generated BPF code.
