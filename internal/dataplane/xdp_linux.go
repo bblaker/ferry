@@ -35,7 +35,12 @@ const (
 	statFIBFail
 	statWrongIface
 	statTTLExceeded
+	statICMPClient
+	statICMPBackend
 	statMax
+
+	// statSlots is the stats map's size, STAT_SLOTS: room for more counters.
+	statSlots = 32
 )
 
 // XDP programs the maps of a loaded ferry XDP program. Map keys and values
@@ -321,6 +326,8 @@ func (x *XDP) Stats() (Stats, error) {
 		FIBFailed:          c[statFIBFail],
 		WrongInterface:     c[statWrongIface],
 		TTLExceeded:        c[statTTLExceeded],
+		ICMPToClient:       c[statICMPClient],
+		ICMPToBackend:      c[statICMPBackend],
 		BackendPackets:     map[uint32]uint64{},
 	}
 	var id uint32

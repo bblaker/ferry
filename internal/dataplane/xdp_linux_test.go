@@ -67,11 +67,14 @@ func TestConstantsMatchBPF(t *testing.T) {
 		"maglev_tables":   MaxServices,
 		"backends":        MaxBackends,
 		"backend_packets": MaxBackends,
-		"stats":           statMax,
+		"stats":           statSlots,
 	} {
 		if got := spec.Maps[name].MaxEntries; got != want {
 			t.Errorf("%s: bpf max_entries %d, Go expects %d", name, got, want)
 		}
+	}
+	if statMax > statSlots {
+		t.Errorf("%d stats don't fit in %d slots", statMax, statSlots)
 	}
 	if got := spec.Maps["maglev_tables"].InnerMap.MaxEntries; got != maglev.DefaultSize {
 		t.Errorf("MAGLEV_SIZE is %d, maglev.DefaultSize is %d", got, maglev.DefaultSize)

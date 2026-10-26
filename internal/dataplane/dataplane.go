@@ -122,6 +122,10 @@ type Stats struct {
 	Forwarded uint64 // client packets NATed to a backend
 	Replied   uint64 // backend packets NATed back to a client
 
+	// ICMP errors about a NATed flow, translated and sent on.
+	ICMPToClient  uint64 // from the backend side, to the flow's client
+	ICMPToBackend uint64 // from the client side, to the flow's backend
+
 	// Packets dropped while forwarding, by reason.
 	SNATExhausted  uint64 // no free SNAT port toward the backend
 	NoNeighbor     uint64 // next hop's MAC address not resolved

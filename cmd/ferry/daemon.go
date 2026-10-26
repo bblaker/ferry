@@ -223,6 +223,9 @@ func writeMetrics(w io.Writer, m metricsSnapshot) {
 	metric("ferry_forwarded_packets_total", "counter", "Packets NATed and transmitted, by direction.")
 	fmt.Fprintf(w, "ferry_forwarded_packets_total{direction=\"to_backend\"} %d\n", m.stats.Forwarded)
 	fmt.Fprintf(w, "ferry_forwarded_packets_total{direction=\"to_client\"} %d\n", m.stats.Replied)
+	metric("ferry_icmp_errors_total", "counter", "ICMP errors about NATed flows, translated and sent on, by direction.")
+	fmt.Fprintf(w, "ferry_icmp_errors_total{direction=\"to_backend\"} %d\n", m.stats.ICMPToBackend)
+	fmt.Fprintf(w, "ferry_icmp_errors_total{direction=\"to_client\"} %d\n", m.stats.ICMPToClient)
 	metric("ferry_dropped_packets_total", "counter", "Packets dropped while forwarding, by reason.")
 	for _, d := range []struct {
 		reason string
