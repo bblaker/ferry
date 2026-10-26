@@ -118,6 +118,22 @@ tables → retire backends. Deleting before swapping frees service IDs and
 what keeps conntrack safe. `Memory` rejects updates that break this order,
 so every reconciler test checks it (see [testing.md](testing.md)).
 
+### When an update fails
+
+Before changing anything, `Apply` checks the snapshot fits: no duplicate
+VIPs, at most 256 services, and at most 1024 backend IDs counting the old
+backends that stay active until the swap is done. A snapshot that fails
+this is rejected (`ErrInvalid`) and the running tables stay whole.
+
+Any later error comes from a map update (`ENOMEM`, say). The data plane is
+then partly updated, but because of the ordering above it still routes
+every flow correctly. The daemon keeps the snapshot as the desired state and
+re-applies it with exponential backoff (1 s, doubling up to 1 min) until it
+converges, or a newer config replaces it. A rejected reload doesn't
+interrupt the retry. `ferry_config_last_reload_successful` reports whether
+the latest config was accepted; `ferry_dataplane_converged` reports whether
+the data plane holds it.
+
 ### Across restarts
 
 The maps and the XDP attachment (a `bpf_link`) are pinned under

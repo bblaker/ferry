@@ -147,7 +147,9 @@ sudo bpftool map dump pinned /sys/fs/bpf/ferry/enp3s0/nat | head
 `sudo systemctl reload ferry`. The reload runs `ferry check` first, so a bad
 file fails the `systemctl` command and the running tables stay as they were.
 Tracked flows keep their backend across the swap. Flows on a removed backend
-are sent to a new one, which resets them, so clients reconnect promptly.
+are sent to a new one, which resets them, so clients reconnect promptly. If
+programming fails partway, Ferry keeps retrying until the tables match the
+file (`ferry_dataplane_converged` is 0 meanwhile); traffic keeps flowing.
 
 **Restart or upgrade:** install the new binary and
 `sudo systemctl restart ferry`. Ferry's maps and XDP attachment are pinned
@@ -183,9 +185,11 @@ sudo ferry detach -iface enp3s0    # traffic to the VIPs now goes to the kernel
 | `ferry_no_backend_total` | counter | slot pointed at an inactive backend (should stay 0) |
 | `ferry_backend_packets_total{backend}` | counter | client packets sent to each active backend |
 | `ferry_services`, `ferry_backends` | gauge | programmed services, active backends |
-| `ferry_config_reloads_total{result}` | counter | config applications, `success` / `failure` |
-| `ferry_config_last_reload_successful` | gauge | 0 after a rejected or failed reload |
-| `ferry_config_last_reload_success_timestamp_seconds` | gauge | time of last good apply |
+| `ferry_config_reloads_total{result}` | counter | configs loaded: `success` (accepted) / `failure` (rejected, tables kept) |
+| `ferry_config_last_reload_successful` | gauge | 0 if the latest config was rejected |
+| `ferry_dataplane_converged` | gauge | 1 if the data plane holds the latest accepted config; 0 while a failed update is retried |
+| `ferry_dataplane_apply_retries_total{result}` | counter | retries of a partly applied config, `success` / `failure` |
+| `ferry_config_last_reload_success_timestamp_seconds` | gauge | when the data plane last converged on an accepted config |
 | `ferry_build_info{version,goversion}` | gauge | always 1 |
 
 Drop reasons:
@@ -218,6 +222,9 @@ groups:
       - alert: FerryReloadFailed
         expr: ferry_config_last_reload_successful == 0
         for: 5m
+      - alert: FerryNotConverged
+        expr: ferry_dataplane_converged == 0
+        for: 5m
       - alert: FerryDropping
         expr: sum by (reason) (rate(ferry_dropped_packets_total[5m])) > 0
         for: 5m
@@ -227,8 +234,9 @@ groups:
 ```
 
 `/healthz` returns 200 whenever the daemon is up and its tables are
-programmed. If the latest reload was rejected, the body says so but the
-status stays 200: the old tables are still serving.
+programmed. If the latest reload was rejected, or an update is still being
+retried, the body says so but the status stays 200: traffic is still being
+forwarded correctly.
 
 ## Troubleshooting
 
@@ -237,6 +245,8 @@ status stays 200: the old tables are still serving.
 | `IPv4 forwarding is off on …` | Install `deploy/90-ferry.conf` (or `sysctl net.ipv4.conf.<iface>.forwarding=1`). |
 | `SNAT ports … overlap the kernel's ephemeral ports` | Reserve them (`net.ipv4.ip_local_reserved_ports`, in `90-ferry.conf`) or pick `-snat-ports` outside `ip_local_port_range`. |
 | `… has several IPv4 addresses; choose one with -snat-ip` | Set `FERRY_SNAT_IP` to the host's own address on the interface. |
+| `… backends plus … being retired need … IDs during the swap` | The reload replaces so many backends that old and new don't fit in 1024 IDs together (`ferry check` can't see this; it starts from empty tables). Remove old backends in one reload, then add the new ones. |
+| `retry: programming failed` repeating, `ferry_dataplane_converged` 0 | A map update keeps failing; the error says why (often `cannot allocate memory`: check the BPF memory limits). The running tables still route correctly. |
 | `pinned maps … are from an incompatible build` | A new build changed a map layout. `ferry detach -iface <iface>` (drops tracked flows), then start. |
 | `attach xdp to …: … operation not supported` | The driver has no native XDP. Use `FERRY_MODE=xdp-generic`, or a NIC whose driver supports it. Switching modes needs `ferry detach` first. |
 | `attach xdp …: device or resource busy` | Another XDP program is attached (`ip link show dev …`). If it was attached with `ip link`, remove it with `sudo ip link set dev <iface> xdp off`. |
