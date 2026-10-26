@@ -25,6 +25,9 @@ Background and motivation: https://bblaker.com/projects/ferry/
 | `nat`            | LRU_HASH            | (backend ip, port, SNAT port, proto) → (client, VIP, TCP state, last seen) |
 | `stats`, `backend_packets` | PERCPU_ARRAY | counters for Prometheus          |
 
+`stats` has 32 slots, more than there are counters, so a new counter
+doesn't change the pinned map's layout.
+
 The SNAT address, SNAT port range and shadow flag are `volatile const`
 globals, set when the program is loaded.
 
@@ -77,6 +80,33 @@ A `conntrack` hit is only used if its `nat` entry is alive and still
 belongs to that client flow; otherwise the packet starts a new flow.
 Expired entries are reclaimed lazily, when a new flow lands on their port,
 or by LRU eviction.
+
+### ICMP errors
+
+An ICMP error is addressed to the source of the packet it quotes, which
+for a NATed flow is an address the real endpoint never used. Ferry
+translates destination unreachable (including "fragmentation needed"),
+time exceeded and parameter problem errors about live flows, as Linux NAT
+does (RFC 5508):
+
+```
+B or a router ──▶ S       quoting S:s ──▶ B:b    nat[B:b, s] → (C:c, VIP:v)
+                          rewrite to  VIP ──▶ C,  quoting C:c ──▶ VIP:v
+C or a router ──▶ VIP     quoting VIP:v ──▶ C:c  conntrack[C:c, VIP:v] → (B, s)
+                          rewrite to  S ──▶ B,    quoting B:b ──▶ S:s
+```
+
+The quoted IP header, ports and (when quoted) L4 checksum are rewritten,
+and the ICMP checksum is patched for each change. The outer source becomes
+the VIP or the SNAT address even when a router sent the error, so the
+receiver's reverse-path filter accepts it. The quoted TTL and a "fragmentation
+needed" MTU stay as they are: Ferry adds no headers, so the MTU still
+applies. An error doesn't refresh its flow. Anything else, including errors
+about expired flows, goes to the kernel.
+
+This keeps path MTU discovery working through Ferry in both directions, and
+makes a backend's "port unreachable" fail a UDP client fast instead of
+timing out.
 
 ### Shadow mode
 

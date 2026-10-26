@@ -179,6 +179,7 @@ sudo ferry detach -iface enp3s0    # traffic to the VIPs now goes to the kernel
 | `ferry_conntrack_reselects_total` | counter | tracked flows whose backend was retired, rehashed |
 | `ferry_forwarded_packets_total{direction}` | counter | NATed and sent: `to_backend`, `to_client` |
 | `ferry_dropped_packets_total{reason}` | counter | see below; all should stay 0 |
+| `ferry_icmp_errors_total{direction}` | counter | ICMP errors about live flows, translated and sent on: `to_backend`, `to_client` |
 | `ferry_no_table_total` | counter | VIP known but no table installed (should stay 0) |
 | `ferry_no_backend_total` | counter | slot pointed at an inactive backend (should stay 0) |
 | `ferry_backend_packets_total{backend}` | counter | client packets sent to each active backend |

@@ -133,6 +133,8 @@ done
 # "offload" that native XDP bypasses. Real NICs receive full checksums, so
 # make the senders compute them: that also tests the NAT checksum updates.
 ip netns exec "$NS" ethtool -K "$PEER" tx off >/dev/null
+# The ICMP errors checked below shouldn't depend on the kernel's rate limit.
+ip netns exec "$NS" sysctl -qw net.ipv4.icmp_ratelimit=0
 # A veth drops native XDP_TX frames unless its peer has XDP enabled too.
 ip netns exec "$NS" "$E2ETOOL" xdp-pass "$PEER" &
 XDPPASS=$!
@@ -146,8 +148,8 @@ for mode in $MODES; do
 	: >"$WORK/ferry.log"
 	start_ferry "$mode"
 	attached || fail "no XDP program on $IF"
-	expect "services programmed" "$(metric ferry_services)" -eq 2
-	expect "backends active" "$(metric ferry_backends)" -eq 5
+	expect "services programmed" "$(metric ferry_services)" -eq 3
+	expect "backends active" "$(metric ferry_backends)" -eq 6
 
 	log "$mode: non-VIP traffic is untouched"
 	ip netns exec "$NS" ping -c 3 -i 0.2 -W 1 "$SNAT" >/dev/null || fail "ping to the host failed"
@@ -162,6 +164,12 @@ for mode in $MODES; do
 		expect "no $reason drops" "$(metric ferry_dropped_packets_total "reason=\"$reason\"")" -eq 0
 	done
 
+	log "$mode: ICMP errors reach the client"
+	# 10.99.0.13 has nothing on port 5354, so its kernel answers with "port
+	# unreachable", addressed to the SNAT address.
+	client refused -addr "$VIP:54" || fail "port unreachable did not reach the client"
+	expect "ICMP errors to clients" "$(metric ferry_icmp_errors_total 'direction="to_client"')" -ge 1
+
 	log "$mode: a held connection survives a reload and a restart"
 	rm -f "$WORK/ready" "$WORK/go"
 	client hold -addr "$VIP:443" -ready "$WORK/ready" -go "$WORK/go" &
@@ -171,7 +179,7 @@ for mode in $MODES; do
 
 	sed -i 's/"10.99.0.13:8443"\]/"10.99.0.13:8443", "10.99.0.14:8443"]/' "$WORK/ferry.json"
 	kill -HUP "$PID"
-	wait_for "[ \$(metric ferry_backends) -eq 6 ]"
+	wait_for "[ \$(metric ferry_backends) -eq 7 ]"
 	client dial -proto tcp -addr "$VIP:443" -n 60 -want-servers 4 >/dev/null || fail "new backend not used after reload"
 	printf 'ok   reload added a backend\n'
 
@@ -192,7 +200,7 @@ for mode in $MODES; do
 	echo '{"services": [' >"$WORK/ferry.json"
 	kill -HUP "$PID"
 	wait_for "[ \$(metric ferry_config_reloads_total 'result=\"failure\"') -eq 1 ]"
-	expect "still serving" "$(metric ferry_services)" -eq 2
+	expect "still serving" "$(metric ferry_services)" -eq 3
 	client dial -proto udp -addr "$VIP:53" -n 10 -want-servers 2 >/dev/null || fail "UDP after a rejected reload"
 	printf 'ok   still forwarding\n'
 
