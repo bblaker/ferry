@@ -3,6 +3,7 @@
 //	e2etool serve ADDR...                 TCP and UDP echo servers that name themselves
 //	e2etool dial -addr VIP -from IP ...   open N connections, report who answered
 //	e2etool hold -addr VIP -from IP ...   keep one connection open across a restart
+//	e2etool refused -addr VIP -from IP    expect a UDP "port unreachable" back
 //	e2etool xdp-pass IFACE                attach an XDP_PASS program until killed
 //
 // Servers answer each line (TCP) or datagram (UDP) with
@@ -11,6 +12,7 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -18,12 +20,13 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 )
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: e2etool serve|dial|hold|xdp-pass ...")
+		fmt.Fprintln(os.Stderr, "usage: e2etool serve|dial|hold|refused|xdp-pass ...")
 		os.Exit(2)
 	}
 	var err error
@@ -34,6 +37,8 @@ func main() {
 		err = dial(os.Args[2:])
 	case "hold":
 		err = hold(os.Args[2:])
+	case "refused":
+		err = refused(os.Args[2:])
 	case "xdp-pass":
 		err = xdpPass(os.Args[2:])
 	default:
@@ -211,4 +216,35 @@ func hold(args []string) error {
 	}
 	fmt.Printf("  held connection to %s survived\n", first.server)
 	return nil
+}
+
+// refused sends one UDP datagram to a VIP whose backend has nothing
+// listening. The backend's ICMP "port unreachable" reaches this connected
+// socket, as ECONNREFUSED, only if Ferry translates it.
+func refused(args []string) error {
+	fs := flag.NewFlagSet("refused", flag.ExitOnError)
+	addr := fs.String("addr", "", "VIP:port")
+	from := fs.String("from", "", "client source address")
+	fs.Parse(args)
+
+	d := net.Dialer{LocalAddr: &net.UDPAddr{IP: net.ParseIP(*from)}}
+	c, err := d.Dial("udp", *addr)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(3 * time.Second))
+	if _, err := fmt.Fprintln(c, "hi"); err != nil {
+		return err
+	}
+	_, err = c.Read(make([]byte, 1500))
+	switch {
+	case errors.Is(err, syscall.ECONNREFUSED):
+		fmt.Println("  connection refused")
+		return nil
+	case err == nil:
+		return errors.New("got an answer, want connection refused")
+	default:
+		return fmt.Errorf("want connection refused (ICMP port unreachable), got: %w", err)
+	}
 }
