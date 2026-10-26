@@ -3,6 +3,7 @@ package main
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -20,20 +21,38 @@ import (
 	"github.com/bblaker/ferry/internal/maglev"
 )
 
-// daemon serializes reloads and metric reads around the reconciler, which is
-// not safe for concurrent use.
+// Retries of a partially applied config back off exponentially between
+// these bounds.
+const (
+	retryMin = time.Second
+	retryMax = time.Minute
+)
+
+// daemon serializes reloads, retries and metric reads around the
+// reconciler, which is not safe for concurrent use.
+//
+// It tracks two things separately: whether the latest config was accepted
+// (valid, and fits the tables), and whether the data plane has converged on
+// the latest accepted config. A data plane update can fail partway (a map
+// update returning ENOMEM, say); the daemon then retries the same snapshot
+// with backoff until it converges or a newer config replaces it.
 type daemon struct {
 	dp     dataplane.Dataplane
 	config string
 	log    *slog.Logger
 
-	applied chan struct{} // signalled after each successful apply
+	applied chan struct{} // signalled each time the data plane converges
 
 	mu        sync.Mutex
 	rec       *controlplane.Reconciler
-	reloads   map[string]uint64 // by result: "success", "failure"
-	lastOK    time.Time
-	lastError error
+	reloads   map[string]uint64 // configs by result: "success" (accepted), "failure" (rejected)
+	reloadErr error             // why the latest config was rejected; nil if accepted
+
+	desired  []discovery.Service // latest accepted config
+	applyErr error               // why the data plane hasn't converged on desired; nil once it has
+	failures int                 // consecutive failed applies of desired
+	retries  map[string]uint64   // retry attempts by result
+	lastOK   time.Time           // when the data plane last converged
 }
 
 func newDaemon(dp dataplane.Dataplane, config string, log *slog.Logger) *daemon {
@@ -44,22 +63,70 @@ func newDaemon(dp dataplane.Dataplane, config string, log *slog.Logger) *daemon 
 		applied: make(chan struct{}, 1),
 		rec:     controlplane.NewReconciler(dp, maglev.DefaultSize, log),
 		reloads: map[string]uint64{"success": 0, "failure": 0},
+		retries: map[string]uint64{"success": 0, "failure": 0},
 	}
 }
 
-// apply programs a snapshot and records the outcome.
+// apply makes services the desired state and programs it. A snapshot the
+// reconciler rejects leaves the data plane, and any retry in progress,
+// untouched. Otherwise it is accepted even if programming fails: the error
+// is returned and retry finishes the job.
 func (d *daemon) apply(services []discovery.Service) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	err := d.rec.Apply(services)
-	d.record(err)
-	if err == nil {
-		select {
-		case d.applied <- struct{}{}:
-		default:
-		}
+	if errors.Is(err, controlplane.ErrInvalid) {
+		d.recordReload(err)
+		return err
+	}
+	d.recordReload(nil)
+	d.desired = services
+	d.failures = 0
+	d.recordApply(err)
+	return err
+}
+
+// retry re-applies the desired state if the data plane hasn't converged on
+// it. It returns the error from that attempt.
+func (d *daemon) retry() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.applyErr == nil {
+		return nil
+	}
+	err := d.rec.Apply(d.desired)
+	if err != nil {
+		d.retries["failure"]++
+	} else {
+		d.retries["success"]++
+	}
+	attempts := d.failures + 1
+	d.recordApply(err)
+	if err != nil {
+		d.log.Warn("retry: programming failed", "attempt", attempts, "next", backoff(d.failures), "err", err)
+	} else {
+		d.log.Info("retry: data plane converged", "attempts", attempts)
 	}
 	return err
+}
+
+// retryDelay reports how long to wait before the next retry, or false if
+// the data plane has converged.
+func (d *daemon) retryDelay() (time.Duration, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.applyErr == nil {
+		return 0, false
+	}
+	return backoff(d.failures), true
+}
+
+// backoff is the wait after n consecutive failures (n >= 1).
+func backoff(n int) time.Duration {
+	if n > 10 { // 2^10 s is far past retryMax; avoid overflowing the shift
+		return retryMax
+	}
+	return min(retryMin<<(n-1), retryMax)
 }
 
 // warmNeighbors keeps the kernel's neighbor (ARP) entries for each
@@ -112,31 +179,48 @@ func (d *daemon) warmNeighbors(ctx context.Context, iface string, every time.Dur
 	}
 }
 
-func (d *daemon) record(err error) {
+func (d *daemon) recordReload(err error) {
 	if err != nil {
 		d.reloads["failure"]++
-		d.lastError = err
-		return
+	} else {
+		d.reloads["success"]++
 	}
-	d.reloads["success"]++
-	d.lastOK = time.Now()
-	d.lastError = nil
+	d.reloadErr = err
 }
 
-// reload re-reads the config file. If the file is invalid, the data plane is
-// left exactly as it was. If programming fails partway, it is left partially
-// updated, which the next successful reload repairs.
+func (d *daemon) recordApply(err error) {
+	d.applyErr = err
+	if err != nil {
+		d.failures++
+		return
+	}
+	d.failures = 0
+	d.lastOK = time.Now()
+	select {
+	case d.applied <- struct{}{}:
+	default:
+	}
+}
+
+// reload re-reads the config file. If the file is invalid or doesn't fit,
+// the data plane is left exactly as it was. If programming fails partway,
+// the data plane is left partially updated (still routing correctly) and
+// retry finishes the job.
 func (d *daemon) reload() error {
 	services, err := discovery.LoadFile(d.config)
 	if err != nil {
 		d.mu.Lock()
-		d.record(err)
+		d.recordReload(err)
 		d.mu.Unlock()
 		d.log.Error("reload: config rejected; keeping current tables", "err", err)
 		return err
 	}
-	if err := d.apply(services); err != nil {
-		d.log.Error("reload: programming failed; data plane may be partially updated", "err", err)
+	switch err := d.apply(services); {
+	case errors.Is(err, controlplane.ErrInvalid):
+		d.log.Error("reload: config rejected; keeping current tables", "err", err)
+		return err
+	case err != nil:
+		d.log.Error("reload: programming failed; data plane partially updated, retrying", "next", retryMin, "err", err)
 		return err
 	}
 	d.log.Info("reloaded", "config", d.config, "services", len(services))
@@ -151,17 +235,20 @@ func (d *daemon) handler() http.Handler {
 }
 
 // serveHealth reports 200 whenever the daemon is up: the data plane is
-// attached and programmed, even if the latest reload was rejected. The body
-// says which.
+// attached and forwarding, even if the latest reload was rejected or an
+// update is still being retried. The body says which.
 func (d *daemon) serveHealth(w http.ResponseWriter, _ *http.Request) {
 	d.mu.Lock()
-	lastErr := d.lastError
+	reloadErr, applyErr := d.reloadErr, d.applyErr
 	d.mu.Unlock()
-	if lastErr != nil {
-		fmt.Fprintf(w, "ok; last reload failed: %v\n", lastErr)
-		return
+	msg := "ok"
+	if reloadErr != nil {
+		msg += fmt.Sprintf("; last reload failed: %v", reloadErr)
 	}
-	fmt.Fprintln(w, "ok")
+	if applyErr != nil {
+		msg += fmt.Sprintf("; data plane not converged, retrying: %v", applyErr)
+	}
+	fmt.Fprintln(w, msg)
 }
 
 // serveMetrics writes the Prometheus text format by hand; there are few
@@ -170,8 +257,14 @@ func (d *daemon) serveMetrics(w http.ResponseWriter, _ *http.Request) {
 	d.mu.Lock()
 	backends := d.rec.Backends()
 	services := d.rec.Services()
-	ok, failed := d.reloads["success"], d.reloads["failure"]
-	lastOK, lastErr := d.lastOK, d.lastError
+	snap := metricsSnapshot{
+		backends: backends,
+		services: services,
+		reloadOK: d.reloads["success"], reloadFailed: d.reloads["failure"],
+		lastOK: d.lastOK, lastFailed: d.reloadErr != nil,
+		converged: d.applyErr == nil,
+		retryOK:   d.retries["success"], retryFailed: d.retries["failure"],
+	}
 	d.mu.Unlock()
 
 	stats, err := d.dp.Stats()
@@ -179,14 +272,9 @@ func (d *daemon) serveMetrics(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	snap.stats = stats
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	writeMetrics(w, metricsSnapshot{
-		stats:    stats,
-		backends: backends,
-		services: services,
-		reloadOK: ok, reloadFailed: failed,
-		lastOK: lastOK, lastFailed: lastErr != nil,
-	})
+	writeMetrics(w, snap)
 }
 
 type metricsSnapshot struct {
@@ -196,6 +284,8 @@ type metricsSnapshot struct {
 	reloadOK, reloadFailed uint64
 	lastOK                 time.Time
 	lastFailed             bool
+	converged              bool
+	retryOK, retryFailed   uint64
 }
 
 func writeMetrics(w io.Writer, m metricsSnapshot) {
@@ -256,12 +346,17 @@ func writeMetrics(w io.Writer, m metricsSnapshot) {
 	metric("ferry_backends", "gauge", "Active backends.")
 	fmt.Fprintf(w, "ferry_backends %d\n", len(m.backends))
 
-	metric("ferry_config_reloads_total", "counter", "Config applications, including the initial one, by result.")
+	metric("ferry_config_reloads_total", "counter", "Config loads, including the initial one, by result: success if accepted, failure if rejected.")
 	fmt.Fprintf(w, "ferry_config_reloads_total{result=\"success\"} %d\n", m.reloadOK)
 	fmt.Fprintf(w, "ferry_config_reloads_total{result=\"failure\"} %d\n", m.reloadFailed)
-	metric("ferry_config_last_reload_successful", "gauge", "1 if the most recent config application succeeded.")
+	metric("ferry_config_last_reload_successful", "gauge", "1 if the most recent config was accepted; see ferry_dataplane_converged for whether it is fully programmed.")
 	fmt.Fprintf(w, "ferry_config_last_reload_successful %d\n", b2i(!m.lastFailed))
-	metric("ferry_config_last_reload_success_timestamp_seconds", "gauge", "Unix time of the last successful config application.")
+	metric("ferry_dataplane_converged", "gauge", "1 if the data plane holds the latest accepted config; 0 while a failed update is retried.")
+	fmt.Fprintf(w, "ferry_dataplane_converged %d\n", b2i(m.converged))
+	metric("ferry_dataplane_apply_retries_total", "counter", "Retries of a partially applied config, by result.")
+	fmt.Fprintf(w, "ferry_dataplane_apply_retries_total{result=\"success\"} %d\n", m.retryOK)
+	fmt.Fprintf(w, "ferry_dataplane_apply_retries_total{result=\"failure\"} %d\n", m.retryFailed)
+	metric("ferry_config_last_reload_success_timestamp_seconds", "gauge", "Unix time the data plane last converged on an accepted config.")
 	var ts int64
 	if !m.lastOK.IsZero() {
 		ts = m.lastOK.Unix()

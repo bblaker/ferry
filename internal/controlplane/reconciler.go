@@ -2,6 +2,7 @@
 package controlplane
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/netip"
@@ -11,6 +12,11 @@ import (
 	"github.com/bblaker/ferry/internal/discovery"
 	"github.com/bblaker/ferry/internal/maglev"
 )
+
+// ErrInvalid marks a snapshot that Apply rejected before changing the data
+// plane: applying it again can't succeed. Any other error from Apply comes
+// from the data plane, and retrying the same snapshot may.
+var ErrInvalid = errors.New("invalid snapshot")
 
 // Reconciler owns ID allocation and drives a Dataplane toward the desired
 // state. It is not safe for concurrent use; run Apply from one goroutine.
@@ -77,18 +83,23 @@ func (r *Reconciler) Restore(st dataplane.State) {
 	}
 }
 
-// Apply converges the data plane on the given snapshot. On error the data
-// plane may be partially updated; calling Apply again with the same snapshot
+// Apply converges the data plane on the given snapshot. A snapshot that
+// can't fit is rejected with ErrInvalid and the data plane is left
+// untouched. On any other error the data plane may be partially updated
+// (but still routes correctly); calling Apply again with the same snapshot
 // finishes the job.
 func (r *Reconciler) Apply(snapshot []discovery.Service) error {
 	desired := make(map[dataplane.ServiceKey][]netip.AddrPort, len(snapshot))
 	for _, s := range snapshot {
 		if _, dup := desired[s.Key]; dup {
-			return fmt.Errorf("duplicate service %s", s.Key)
+			return fmt.Errorf("%w: duplicate service %s", ErrInvalid, s.Key)
 		}
 		bs := slices.Clone(s.Backends)
 		slices.SortFunc(bs, netip.AddrPort.Compare)
 		desired[s.Key] = slices.Compact(bs)
+	}
+	if err := r.fits(desired); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalid, err)
 	}
 
 	// 1. Activate referenced backends.
@@ -162,6 +173,37 @@ func (r *Reconciler) Apply(snapshot []discovery.Service) error {
 		}
 		delete(r.backendIDs, b)
 		r.log.Info("retired backend", "backend", b, "id", id)
+	}
+	return nil
+}
+
+// fits checks that every ID Apply will allocate is available, so a snapshot
+// that can never be applied fails before anything changes.
+func (r *Reconciler) fits(desired map[dataplane.ServiceKey][]netip.AddrPort) error {
+	services := 0
+	ids := len(r.backendIDs)
+	seen := map[netip.AddrPort]bool{}
+	for _, bs := range desired {
+		if len(bs) > 0 {
+			services++ // gone or emptied services are deleted first
+		}
+		for _, b := range bs {
+			if _, ok := r.backendIDs[b]; !ok && !seen[b] {
+				ids++
+			}
+			seen[b] = true
+		}
+	}
+	if services > dataplane.MaxServices {
+		return fmt.Errorf("%d services; the table holds %d", services, dataplane.MaxServices)
+	}
+	// New backends are activated before old ones retire, so both need IDs.
+	if ids > dataplane.MaxBackends {
+		if retiring := ids - len(seen); retiring > 0 {
+			return fmt.Errorf("%d backends plus %d being retired need %d IDs during the swap; the table holds %d, so retire old backends in an earlier reload",
+				len(seen), retiring, ids, dataplane.MaxBackends)
+		}
+		return fmt.Errorf("%d backends; the table holds %d", ids, dataplane.MaxBackends)
 	}
 	return nil
 }

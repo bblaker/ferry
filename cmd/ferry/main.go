@@ -128,8 +128,13 @@ func run(cfg dataplane.XDPConfig, config, metricsAddr string, log *slog.Logger) 
 		return err
 	}
 	d.rec.Restore(st)
-	if err := d.apply(services); err != nil {
+	// A config that can't fit is fatal. A failed update isn't: the retry
+	// below finishes it, and meanwhile the data plane routes correctly with
+	// whatever was programmed.
+	if err := d.apply(services); errors.Is(err, controlplane.ErrInvalid) {
 		return err
+	} else if err != nil {
+		log.Error("programming failed; data plane partially updated, retrying", "next", retryMin, "err", err)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -155,10 +160,22 @@ func run(cfg dataplane.XDPConfig, config, metricsAddr string, log *slog.Logger) 
 
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
+	var retry <-chan time.Time // nil while converged
+	schedule := func() {
+		retry = nil
+		if delay, ok := d.retryDelay(); ok {
+			retry = time.After(delay)
+		}
+	}
+	schedule()
 	for {
 		select {
 		case <-hup:
 			d.reload()
+			schedule()
+		case <-retry:
+			d.retry()
+			schedule()
 		case <-ctx.Done():
 			if cfg.Iface != "" && cfg.PinDir != "" {
 				log.Info("shutting down; the pinned program keeps forwarding with the current tables (ferry detach removes it)")

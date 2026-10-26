@@ -1,6 +1,8 @@
 package controlplane
 
 import (
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/netip"
@@ -132,5 +134,62 @@ func TestRestoreKeepsIDs(t *testing.T) {
 	}
 	if dp.Services() != 1 {
 		t.Errorf("%d services programmed, want 1", dp.Services())
+	}
+}
+
+// addrs returns n backends 10.<net>.x.y:8443.
+func addrs(net byte, n int) []string {
+	out := make([]string, n)
+	for i := range out {
+		out[i] = fmt.Sprintf("10.%d.%d.%d:8443", net, i/256, i%256)
+	}
+	return out
+}
+
+// TestApplyRejectsWhatCanNeverFit: a snapshot that can't be applied fails
+// with ErrInvalid before the data plane changes, so the daemon knows not to
+// retry it and the running tables stay whole.
+func TestApplyRejectsWhatCanNeverFit(t *testing.T) {
+	manyServices := make([]discovery.Service, dataplane.MaxServices+1)
+	for i := range manyServices {
+		key := dataplane.ServiceKey{VIP: netip.AddrFrom4([4]byte{192, 168, byte(i / 256), byte(i % 256)}), Port: 443, Proto: dataplane.TCP}
+		manyServices[i] = svc(key, "10.0.0.1:8443")
+	}
+	for _, tc := range []struct {
+		name string
+		snap []discovery.Service
+	}{
+		{"duplicate service", []discovery.Service{svc(web, "10.0.0.1:8443"), svc(web, "10.0.0.2:8443")}},
+		{"too many services", manyServices},
+		// 1000 running + 100 new > 1024, though the result would hold 100.
+		{"old and new backends together", []discovery.Service{svc(web, addrs(2, 100)...)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, dp := newTest(t)
+			if err := r.Apply([]discovery.Service{svc(web, addrs(1, 1000)...)}); err != nil {
+				t.Fatal(err)
+			}
+			err := r.Apply(tc.snap)
+			if !errors.Is(err, ErrInvalid) {
+				t.Fatalf("Apply = %v, want ErrInvalid", err)
+			}
+			if dp.Services() != 1 || dp.ActiveBackends() != 1000 || len(r.Backends()) != 1000 {
+				t.Errorf("data plane changed: %d services, %d active backends, %d IDs", dp.Services(), dp.ActiveBackends(), len(r.Backends()))
+			}
+		})
+	}
+}
+
+// TestBackendSwapInTwoSteps follows the advice in the capacity error:
+// shrink the old set first, then bring in the new one.
+func TestBackendSwapInTwoSteps(t *testing.T) {
+	r, dp := newTest(t)
+	for _, bs := range [][]string{addrs(1, 1000), addrs(1, 924), addrs(2, 100)} {
+		if err := r.Apply([]discovery.Service{svc(web, bs...)}); err != nil {
+			t.Fatalf("%d backends: %v", len(bs), err)
+		}
+	}
+	if got := dp.ServiceBackends(web); len(got) != 100 || got[0].Addr().As4()[1] != 2 {
+		t.Errorf("serving %d backends starting %v, want the 100 new ones", len(got), got[0])
 	}
 }
