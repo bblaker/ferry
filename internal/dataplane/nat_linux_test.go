@@ -169,7 +169,10 @@ func (f *fixture) natEntry(backend netip.AddrPort, port uint16, proto Proto) (fe
 	return e, true
 }
 
-// expire backdates a flow's NAT entry past every timeout.
+// expire backdates a flow's NAT entry past its timeout. It also marks the
+// flow closed, which has the shortest TCP timeout (10 s): the kernel clock
+// counts from boot, so on a freshly booted CI runner no time is long enough
+// ago to expire an established flow (900 s).
 func (f *fixture) expire(backend netip.AddrPort, port uint16, proto Proto) {
 	f.t.Helper()
 	e, ok := f.natEntry(backend, port, proto)
@@ -177,6 +180,7 @@ func (f *fixture) expire(backend netip.AddrPort, port uint16, proto Proto) {
 		f.t.Fatalf("no NAT entry for %s port %d", backend, port)
 	}
 	e.LastSeenNs = 0
+	e.State = 3 // FLOW_CLOSED
 	k := ferryNatKey{BackendIp: be32(backend.Addr().As4()), BackendPort: be16(backend.Port()), SnatPort: be16(port), Proto: uint8(proto)}
 	if err := f.x.objs.Nat.Put(k, e); err != nil {
 		f.t.Fatal(err)

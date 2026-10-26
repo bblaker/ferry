@@ -33,7 +33,6 @@
 
 #include <linux/bpf.h>
 #include <linux/if_ether.h>
-#include <linux/icmp.h>
 #include <linux/in.h>
 #include <linux/ip.h>
 #include <linux/tcp.h>
@@ -41,9 +40,20 @@
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_helpers.h>
 
-#ifndef AF_INET // linux/icmp.h defines it on some systems
 #define AF_INET 2
-#endif
+
+// From linux/icmp.h, which can't be included: it pulls in libc headers that
+// don't build for the BPF target on every distribution.
+#define ICMP_DEST_UNREACH 3
+#define ICMP_TIME_EXCEEDED 11
+#define ICMP_PARAMETERPROB 12
+
+struct icmphdr {
+	__u8 type;
+	__u8 code;
+	__u16 checksum;
+	__u32 rest; // depends on type; "fragmentation needed" holds the MTU here
+};
 
 // Keep in sync with internal/dataplane and internal/maglev.
 #define MAGLEV_SIZE 16381
