@@ -42,8 +42,8 @@ make check test-bpf e2e       # unit, in-kernel and end-to-end tests
 make build-linux              # bin/ferry-linux-arm64 (GOARCH=amd64 for x86)
 ```
 
-CI builds the same binary on every push to `main`; it's attached to the
-workflow run as `ferry-linux-arm64`.
+CI builds the same binary on every push to `main`, on an arm64 runner after
+the tests pass there; it's attached to the workflow run as `ferry-linux-arm64`.
 
 ## Install
 
