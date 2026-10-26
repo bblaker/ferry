@@ -71,16 +71,13 @@ has not run on the real edge host yet.
 
 ## Engineering hygiene
 
-19. Add an `ubuntu-24.04-arm` CI job so the BPF and e2e tests also run on
-    the Pi's architecture. Today CI runs them on x86_64; arm64 is covered
-    only locally, in Docker.
-20. Add `staticcheck` or `golangci-lint` to `make check`.
-21. Fuzz the packet parser: random frames through `BPF_PROG_TEST_RUN`,
+19. Add `staticcheck` or `golangci-lint` to `make check`.
+20. Fuzz the packet parser: random frames through `BPF_PROG_TEST_RUN`,
     asserting no unexpected actions or counter movement.
-22. Release process: tagged versions (`ferry version` already reports a
+21. Release process: tagged versions (`ferry version` already reports a
     module version or VCS revision), checksummed release artifacts, and a
     changelog.
-23. A Grafana dashboard and a Prometheus rules file to go with the starter
+22. A Grafana dashboard and a Prometheus rules file to go with the starter
     alerts in [deploy.md](deploy.md#metrics).
-24. Teach `Memory` to simulate conntrack, so controlplane tests can assert
+23. Teach `Memory` to simulate conntrack, so controlplane tests can assert
     connection continuity without root.

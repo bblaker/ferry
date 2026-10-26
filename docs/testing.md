@@ -9,7 +9,8 @@ Four layers. Each catches something the layer below can't.
 | BPF, in-kernel | `make test-bpf` | Docker (macOS) or root (Linux: `make test-bpf-native`) | the real `bpf/ferry.c` against crafted packets, via `BPF_PROG_TEST_RUN`: selection, NAT, checksums, routing, flow state, pinning |
 | end-to-end | `make e2e` | Docker (macOS) or root (Linux: `make e2e-native`) | the `ferry` binary forwarding real TCP/UDP connections; reload, restart, detach |
 
-CI runs all four on every push and PR.
+CI runs all four on every push and PR, on both x86_64 and arm64 (the
+Pi's architecture).
 
 ## Unit and randomized tests
 
