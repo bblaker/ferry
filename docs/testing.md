@@ -71,10 +71,25 @@ cover:
 - pinned maps surviving a reload, and switching from shadow to forwarding
   on them.
 
+`internal/dataplane/icmp_linux_test.go` covers ICMP errors on the same
+topology. Each error quotes a packet exactly as its sender received it. After
+translation, the quote must match the packet the new recipient originally
+sent, byte for byte apart from the TTL, and the outer, ICMP and quoted
+checksums are all verified. The tests cover:
+
+- errors toward the client: "fragmentation needed" and "port unreachable"
+  from the backend, "time exceeded" from a router, quotes cut off before
+  the TCP checksum, quoted IP options, and clients behind a gateway;
+- errors toward the backend, from a router near the client and from the
+  client itself;
+- what must go to the kernel instead: non-errors, the host's own traffic,
+  untracked or expired flows, a SNAT port since reused by another flow,
+  truncated and fragment quotes, and errors in shadow mode.
+
 Without root they skip; `make test-bpf*` sets `FERRY_REQUIRE_BPF=1` so a
 skip fails instead. `BenchmarkIngressShadow` and `BenchmarkIngressForward`
 report in-kernel time per tracked packet (on an M-series Mac under Docker,
-about 46 ns in shadow mode and 92 ns forwarding). Use them to spot
+about 47 ns in shadow mode and 90 ns forwarding). Use them to spot
 regressions, not as line-rate figures.
 
 ## End-to-end
@@ -91,6 +106,9 @@ and the clients. The suite runs in `xdp-generic`, then `xdp-native`:
 2. ping to the host still works (non-VIP traffic is untouched);
 3. 60 TCP connections and 60 UDP exchanges through the VIPs: every backend
    answers, every backend saw the SNAT address, no drops of any kind;
+   then a UDP datagram to a backend port with no listener, where the
+   backend's ICMP "port unreachable" must come back through Ferry as
+   `ECONNREFUSED`;
 4. a TCP connection is opened and held, then:
    - a SIGHUP reload adds a fourth backend, and new connections use it;
    - ferry stops: the pinned program stays attached and new connections
@@ -125,11 +143,17 @@ notices. These were checked when the harness was written:
 | flows never expire | `TestExpiredFlowStartsOver`, `TestSNATExhaustion` |
 | no egress-interface check | `TestUnroutableBackendsDropWithoutState` |
 | reconciler ignores restored state | `TestRestoreKeepsIDs` |
+| any one ICMP checksum patch left out (quoted ports, quoted IP or L4 checksum) | `TestICMPErrorReachesClient` |
+| ICMP error's outer source left as its sender | same |
+| no "sent to the quoted source" check, no fragment check, or echo translated | `TestICMPNotAboutAFlow` |
+| ICMP to the client ignores expiry | `TestICMPNotAboutAFlow` |
+| ICMP to the backend ignores expiry or port reuse | `TestICMPAboutAnEndedFlowFromClientSide` |
+| ICMP translation turned off | e2e fails: "port unreachable did not reach the client" |
 
 ## Adding tests
 
-- A new packet-path behaviour belongs in `xdp_linux_test.go` (selection) or
-  `nat_linux_test.go` (forwarding). Build the frame with `frame()` or
+- A new packet-path behaviour belongs in `xdp_linux_test.go` (selection),
+  `nat_linux_test.go` (forwarding) or `icmp_linux_test.go` (ICMP errors). Build the frame with `frame()` or
   `withFlags()`, compare against `Memory` where the behaviour is about
   backend choice, and decode output with `decode()`, which checks checksums.
 - A new ordering rule belongs in `Memory`, as a rejected update, so every

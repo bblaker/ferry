@@ -11,73 +11,68 @@ has not run on the real edge host yet.
    passed `systemd-analyze verify` and a capability test in Docker), roll
    out in shadow mode, then forward. Measure throughput and latency with real
    traffic (iperf3 for a first look, pktgen or TRex for packet rates).
-2. **Translate ICMP errors for NATed flows.** A backend's "fragmentation
-   needed" or "port unreachable" is addressed to the SNAT address and goes to
-   the kernel, so the client never gets it. Path MTU discovery through Ferry
-   is broken until the program rewrites ICMP errors (and the packet headers
-   they quote) back to the client.
-3. **Retry partial reload failures.** If a map update fails partway through
+2. **Retry partial reload failures.** If a map update fails partway through
    `Apply`, the data plane stays partly updated until the next SIGHUP. Retry
    with backoff, and expose "converged" separately from "last reload OK".
-4. **NAT table visibility.** Export how many flows are live (per backend,
+3. **NAT table visibility.** Export how many flows are live (per backend,
    by state) and how full the SNAT pools are, so `snat_exhausted` can be
    alerted on before it happens. That needs a periodic map walk in
    userspace, which could also sweep expired entries instead of leaving them
    for lazy reclaim and LRU eviction.
-5. **Map layout upgrades.** A build that changes a map's layout currently
+4. **Map layout upgrades.** A build that changes a map's layout currently
    needs `ferry detach`, which drops every flow. Migrate pinned maps on
    startup instead (copy into new maps, then swap the program).
 
 ## Features
 
-6. Kubernetes EndpointSlice discovery source (`internal/discovery`).
-7. Active and passive health checks feeding discovery. Seeing both
+5. Kubernetes EndpointSlice discovery source (`internal/discovery`).
+6. Active and passive health checks feeding discovery. Seeing both
    directions makes passive checks possible: RSTs and unanswered SYNs per
    backend.
-8. Client addresses for backends. Full NAT hides them. The L7 /
+7. Client addresses for backends. Full NAT hides them. The L7 /
    `crypto/tls` termination path can add `X-Forwarded-For`; for plain TCP,
    consider the PROXY protocol from that path too.
-9. Fragmented packets to a VIP go to the kernel, so large UDP datagrams to a
+8. Fragmented packets to a VIP go to the kernel, so large UDP datagrams to a
    VIP are lost. Track fragments, or reassemble.
-10. More than one interface (two-armed: clients on one NIC, backends on
+9. More than one interface (two-armed: clients on one NIC, backends on
     another) and backends on the edge host itself. Both need the program on
     every interface traffic can return on, and `bpf_redirect` where the
     egress driver supports it.
-11. gRPC/protobuf control API (today: config file + SIGHUP).
-12. Per-service counters. Today there are only global and per-backend ones.
-13. IPv6, VLAN-tagged frames, weighted Maglev.
-14. Optional: watch the config file and reload on change, instead of
+10. gRPC/protobuf control API (today: config file + SIGHUP).
+11. Per-service counters. Today there are only global and per-backend ones.
+12. IPv6, VLAN-tagged frames, weighted Maglev.
+13. Optional: watch the config file and reload on change, instead of
     relying on `systemctl reload`.
 
 ## Design questions
 
-15. **Backends shared across services.** A backend is identified by
+14. **Backends shared across services.** A backend is identified by
     `ip:port` globally. If one is removed from service A but still used by
     service B, it stays active, so A's tracked flows keep going to it. Decide
     whether conntrack hits should also check the backend is still in the
     flow's service.
-16. **Backend capacity headroom.** New backends are activated before old
+15. **Backend capacity headroom.** New backends are activated before old
     ones are retired, so one reload must fit old and new backends together
     in 1024 IDs. Replacing a near-full set needs two steps. Document this or
     stage it automatically.
-17. **Two LRU maps per flow.** `conntrack` and `nat` evict independently. If
+16. **Two LRU maps per flow.** `conntrack` and `nat` evict independently. If
     either loses a live flow's entry under memory pressure, the flow breaks.
     Both hold 65536 entries; consider one map keyed both ways, or sizing
     them from the SNAT pool.
-18. **A stopped daemon leaves forwarding on.** That is what makes restarts
+17. **A stopped daemon leaves forwarding on.** That is what makes restarts
     safe, but a crashed control plane goes unnoticed by the data plane.
     The `FerryDown` alert covers it today; consider a staleness metric
     exported from the data plane itself.
 
 ## Engineering hygiene
 
-19. Add `staticcheck` or `golangci-lint` to `make check`.
-20. Fuzz the packet parser: random frames through `BPF_PROG_TEST_RUN`,
+18. Add `staticcheck` or `golangci-lint` to `make check`.
+19. Fuzz the packet parser: random frames through `BPF_PROG_TEST_RUN`,
     asserting no unexpected actions or counter movement.
-21. Release process: tagged versions (`ferry version` already reports a
+20. Release process: tagged versions (`ferry version` already reports a
     module version or VCS revision), checksummed release artifacts, and a
     changelog.
-22. A Grafana dashboard and a Prometheus rules file to go with the starter
+21. A Grafana dashboard and a Prometheus rules file to go with the starter
     alerts in [deploy.md](deploy.md#metrics).
-23. Teach `Memory` to simulate conntrack, so controlplane tests can assert
+22. Teach `Memory` to simulate conntrack, so controlplane tests can assert
     connection continuity without root.
