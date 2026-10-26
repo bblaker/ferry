@@ -28,7 +28,10 @@ layer covers and where new tests go.
   `Flow.Hash` and its golden values to match.
 - Changes to update ordering or the table swap need a test in
   `internal/controlplane`, since that is where connection continuity lives.
-  Packet-path changes need a test in `internal/dataplane/xdp_linux_test.go`.
+  Packet-path changes need a test in `internal/dataplane/xdp_linux_test.go`
+  (selection) or `nat_linux_test.go` (forwarding).
+- Changing a map's key or value layout breaks restarts onto pinned state
+  ("incompatible build"); call it out in the commit message.
 - Explain the *why* in commit messages. One logical change per commit.
 
 ## Licensing

@@ -102,6 +102,7 @@ func TestMetrics(t *testing.T) {
 	}
 	dp.stats = dataplane.Stats{
 		Packets: 100, ServiceHits: 60, ConntrackHits: 50, ConntrackReselects: 2, NoTable: 1, NoBackend: 3,
+		Forwarded: 58, Replied: 40, SNATExhausted: 4, NoNeighbor: 5, FIBFailed: 6, WrongInterface: 7, TTLExceeded: 8,
 		BackendPackets: map[uint32]uint64{byAddr["10.0.0.1:8443"]: 35, byAddr["10.0.0.2:8443"]: 25},
 	}
 
@@ -113,6 +114,13 @@ func TestMetrics(t *testing.T) {
 		"ferry_conntrack_reselects_total 2",
 		"ferry_no_table_total 1",
 		"ferry_no_backend_total 3",
+		`ferry_forwarded_packets_total{direction="to_backend"} 58`,
+		`ferry_forwarded_packets_total{direction="to_client"} 40`,
+		`ferry_dropped_packets_total{reason="snat_exhausted"} 4`,
+		`ferry_dropped_packets_total{reason="no_neighbor"} 5`,
+		`ferry_dropped_packets_total{reason="fib_failed"} 6`,
+		`ferry_dropped_packets_total{reason="wrong_interface"} 7`,
+		`ferry_dropped_packets_total{reason="ttl_exceeded"} 8`,
 		`ferry_backend_packets_total{backend="10.0.0.1:8443"} 35`,
 		`ferry_backend_packets_total{backend="10.0.0.2:8443"} 25`,
 		"ferry_services 1",
