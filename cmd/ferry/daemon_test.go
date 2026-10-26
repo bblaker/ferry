@@ -1,6 +1,8 @@
 package main
 
 import (
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -10,7 +12,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/bblaker/ferry/internal/controlplane"
 	"github.com/bblaker/ferry/internal/dataplane"
 )
 
@@ -21,13 +25,46 @@ const (
 
 var web = dataplane.ServiceKey{VIP: netip.MustParseAddr("192.168.1.240"), Port: 443, Proto: dataplane.TCP}
 
-// counting is a Memory data plane with canned packet counters.
+// counting is a Memory data plane with canned packet counters. It fails its
+// next failN updates, as a kernel map update can (ENOMEM).
 type counting struct {
 	*dataplane.Memory
 	stats dataplane.Stats
+	failN int
 }
 
+var errNoMem = errors.New("update map: cannot allocate memory")
+
 func (c *counting) Stats() (dataplane.Stats, error) { return c.stats, nil }
+
+func (c *counting) fail() bool {
+	if c.failN > 0 {
+		c.failN--
+		return true
+	}
+	return false
+}
+
+func (c *counting) SetBackend(id uint32, b dataplane.Backend) error {
+	if c.fail() {
+		return errNoMem
+	}
+	return c.Memory.SetBackend(id, b)
+}
+
+func (c *counting) SetService(key dataplane.ServiceKey, id uint32, slots []uint32) error {
+	if c.fail() {
+		return errNoMem
+	}
+	return c.Memory.SetService(key, id, slots)
+}
+
+func (c *counting) DeleteService(key dataplane.ServiceKey, id uint32) error {
+	if c.fail() {
+		return errNoMem
+	}
+	return c.Memory.DeleteService(key, id)
+}
 
 func newTestDaemon(t *testing.T, config string) (*daemon, *counting, string) {
 	t.Helper()
@@ -127,6 +164,8 @@ func TestMetrics(t *testing.T) {
 		"ferry_backends 2",
 		`ferry_config_reloads_total{result="success"} 1`,
 		"ferry_config_last_reload_successful 1",
+		"ferry_dataplane_converged 1",
+		`ferry_dataplane_apply_retries_total{result="failure"} 0`,
 		"# TYPE ferry_packets_total counter",
 	} {
 		if !strings.Contains(m, want+"\n") {
@@ -155,4 +194,141 @@ func get(t *testing.T, d *daemon, path string, wantCode int) string {
 		t.Fatalf("GET %s: %d, want %d", path, rec.Code, wantCode)
 	}
 	return rec.Body.String()
+}
+
+// metricsHave fails the test unless every sample is in d's metrics.
+func metricsHave(t *testing.T, d *daemon, samples ...string) {
+	t.Helper()
+	m := get(t, d, "/metrics", http.StatusOK)
+	for _, want := range samples {
+		if !strings.Contains(m, want+"\n") {
+			t.Errorf("metrics missing %q", want)
+		}
+	}
+}
+
+func wantRetryIn(t *testing.T, d *daemon, want time.Duration) {
+	t.Helper()
+	got, ok := d.retryDelay()
+	switch {
+	case want == 0 && ok:
+		t.Errorf("retry scheduled in %v, want none (converged)", got)
+	case want != 0 && !ok:
+		t.Errorf("no retry scheduled, want one in %v", want)
+	case got != want:
+		t.Errorf("retry in %v, want %v", got, want)
+	}
+}
+
+// TestRetryAfterPartialFailure: a valid config whose programming fails is
+// accepted, reported as not converged, and retried with backoff until it
+// lands.
+func TestRetryAfterPartialFailure(t *testing.T) {
+	d, dp, path := newTestDaemon(t, twoBackends)
+	writeFile(t, path, oneBackend)
+	dp.failN = 2 // the reload and the first retry
+	if err := d.reload(); !errors.Is(err, errNoMem) {
+		t.Fatalf("reload = %v, want the data plane error", err)
+	}
+	metricsHave(t, d, "ferry_config_last_reload_successful 1", "ferry_dataplane_converged 0")
+	if body := get(t, d, "/healthz", http.StatusOK); !strings.Contains(body, "not converged") {
+		t.Errorf("healthz = %q, want it to report the pending update", body)
+	}
+	wantRetryIn(t, d, time.Second)
+
+	if err := d.retry(); !errors.Is(err, errNoMem) {
+		t.Fatalf("first retry = %v, want the data plane error", err)
+	}
+	wantRetryIn(t, d, 2*time.Second)
+
+	if err := d.retry(); err != nil {
+		t.Fatalf("second retry: %v", err)
+	}
+	wantRetryIn(t, d, 0)
+	if got := len(dp.ServiceBackends(web)); got != 1 {
+		t.Errorf("%d backends programmed after the retry, want 1", got)
+	}
+	metricsHave(t, d,
+		"ferry_dataplane_converged 1",
+		`ferry_dataplane_apply_retries_total{result="success"} 1`,
+		`ferry_dataplane_apply_retries_total{result="failure"} 1`,
+		`ferry_config_reloads_total{result="failure"} 0`,
+	)
+	if body := get(t, d, "/healthz", http.StatusOK); body != "ok\n" {
+		t.Errorf("healthz = %q, want ok", body)
+	}
+}
+
+// TestRejectedReloadKeepsRetrying: a bad config arriving mid-retry is
+// rejected, and the retry still converges on the last accepted config.
+func TestRejectedReloadKeepsRetrying(t *testing.T) {
+	d, dp, path := newTestDaemon(t, twoBackends)
+	writeFile(t, path, oneBackend)
+	dp.failN = 1
+	d.reload()
+	writeFile(t, path, `{"services": [`)
+	if err := d.reload(); err == nil {
+		t.Fatal("bad config accepted")
+	}
+	wantRetryIn(t, d, time.Second)
+	if err := d.retry(); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(dp.ServiceBackends(web)); got != 1 {
+		t.Errorf("%d backends programmed, want 1 (the last accepted config)", got)
+	}
+	metricsHave(t, d, "ferry_config_last_reload_successful 0", "ferry_dataplane_converged 1")
+}
+
+// TestReloadReplacesRetry: a newer config replaces the one being retried,
+// and its retries back off from the start.
+func TestReloadReplacesRetry(t *testing.T) {
+	d, dp, path := newTestDaemon(t, twoBackends)
+	writeFile(t, path, oneBackend)
+	dp.failN = 2
+	d.reload()
+	d.retry()
+	wantRetryIn(t, d, 2*time.Second)
+
+	writeFile(t, path, twoBackends)
+	dp.failN = 1
+	if err := d.reload(); !errors.Is(err, errNoMem) {
+		t.Fatalf("reload = %v, want the data plane error", err)
+	}
+	wantRetryIn(t, d, time.Second)
+	if err := d.retry(); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(dp.ServiceBackends(web)); got != 2 {
+		t.Errorf("%d backends programmed, want 2 (the newer config)", got)
+	}
+}
+
+// TestConfigThatCannotFitIsRejected: a config the tables can't hold is
+// rejected outright, not retried, and the running tables stay whole.
+func TestConfigThatCannotFitIsRejected(t *testing.T) {
+	d, dp, path := newTestDaemon(t, twoBackends)
+	var bs []string
+	for i := range dataplane.MaxBackends + 1 {
+		bs = append(bs, fmt.Sprintf("%q", fmt.Sprintf("10.1.%d.%d:8443", i/256, i%256)))
+	}
+	writeFile(t, path, `{"services": [{"name": "web", "vip": "192.168.1.240:443", "backends": [`+strings.Join(bs, ",")+`]}]}`)
+	if err := d.reload(); !errors.Is(err, controlplane.ErrInvalid) {
+		t.Fatalf("reload = %v, want ErrInvalid", err)
+	}
+	wantRetryIn(t, d, 0)
+	if got := len(dp.ServiceBackends(web)); got != 2 {
+		t.Errorf("%d backends programmed, want the original 2", got)
+	}
+	metricsHave(t, d, "ferry_config_last_reload_successful 0", "ferry_dataplane_converged 1")
+}
+
+func TestBackoff(t *testing.T) {
+	for n, want := range map[int]time.Duration{
+		1: time.Second, 2: 2 * time.Second, 6: 32 * time.Second, 7: time.Minute, 100: time.Minute,
+	} {
+		if got := backoff(n); got != want {
+			t.Errorf("backoff(%d) = %v, want %v", n, got, want)
+		}
+	}
 }

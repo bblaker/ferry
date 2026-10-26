@@ -4,7 +4,7 @@ Four layers. Each catches something the layer below can't.
 
 | layer | command | needs | covers |
 |---|---|---|---|
-| unit | `make check` | Go | Maglev properties, config parsing, metrics, reload behaviour |
+| unit | `make check` | Go | Maglev properties, config parsing, metrics, reload and retry behaviour |
 | reconciler, randomized | (part of `make check`) | Go | update ordering under random snapshots and injected failures |
 | BPF, in-kernel | `make test-bpf` | Docker (macOS) or root (Linux: `make test-bpf-native`) | the real `bpf/ferry.c` against crafted packets, via `BPF_PROG_TEST_RUN`: selection, NAT, checksums, routing, flow state, pinning |
 | end-to-end | `make e2e` | Docker (macOS) or root (Linux: `make e2e-native`) | the `ferry` binary forwarding real TCP/UDP connections; reload, restart, detach |
@@ -125,6 +125,11 @@ notices. These were checked when the harness was written:
 | flows never expire | `TestExpiredFlowStartsOver`, `TestSNATExhaustion` |
 | no egress-interface check | `TestUnroutableBackendsDropWithoutState` |
 | reconciler ignores restored state | `TestRestoreKeepsIDs` |
+| no capacity check before changing the data plane, or old backends not counted | `TestApplyRejectsWhatCanNeverFit` |
+| daemon retries a config that can't fit | `TestConfigThatCannotFitIsRejected` |
+| retry backoff doesn't grow, isn't capped, or doesn't restart for a new config | `TestRetryAfterPartialFailure`, `TestBackoff`, `TestReloadReplacesRetry` |
+| a rejected reload cancels the retry | `TestRejectedReloadKeepsRetrying` |
+| a partly applied config counted as rejected, or converged reported wrong | `TestRetryAfterPartialFailure`, `TestMetrics` |
 
 ## Adding tests
 
